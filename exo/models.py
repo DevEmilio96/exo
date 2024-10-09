@@ -60,3 +60,15 @@ model_base_shards = {
     "MLXDynamicShardInferenceEngine": Shard(model_id="mlx-community/Qwen2.5-Math-72B-Instruct-4bit", start_layer=0, end_layer=0, n_layers=80),
   },
 }
+
+MODEL_CONFIG = {
+    "llama-3.1-8b": {"params": 8_000_000_000, "layers": 32},
+    "llama-3.1-70b": {"params": 70_000_000_000, "layers": 80},
+    # Add more models here with their number of parameters and layers
+}
+
+ENGINE_FACTORS = {
+    "MLXDynamicShardInferenceEngine": 0.5,  # 4-bit
+    "TinygradDynamicShardInferenceEngine": 2,  # BF16 (16-bit)
+    # add more engines here with their byte per parameter
+}

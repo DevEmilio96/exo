@@ -10,6 +10,8 @@ import netifaces
 from pathlib import Path
 import tempfile
 
+from exo.models import ENGINE_FACTORS, MODEL_CONFIG
+
 DEBUG = int(os.getenv("DEBUG", default="0"))
 DEBUG_DISCOVERY = int(os.getenv("DEBUG_DISCOVERY", default="0"))
 VERSION = "0.0.1"
@@ -207,6 +209,20 @@ def pretty_print_bytes(size_in_bytes: int) -> str:
   else:
     return f"{size_in_bytes / (1024 ** 4):.2f} TB"
 
+def update_memory_for_layer(model_name: str, engine: str) -> int:    
+    if model_name not in MODEL_CONFIG:
+        raise ValueError(f"Model '{model_name}' not found in configurations")
+    if engine not in ENGINE_FACTORS:
+        raise ValueError(f"Engine '{engine}' not found in configurations")
+    
+    model_config = MODEL_CONFIG[model_name]
+    byte_per_param = ENGINE_FACTORS[engine]
+    
+    model_size = model_config["params"] * byte_per_param
+    model_size_mb = model_size / (1024 * 1024)
+    memory_for_layer = model_size_mb / model_config["layers"]
+
+    return int(memory_for_layer)
 
 def pretty_print_bytes_per_second(bytes_per_second: int) -> str:
   if bytes_per_second < 1024:

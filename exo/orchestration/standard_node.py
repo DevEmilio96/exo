@@ -7,6 +7,8 @@ import traceback
 from typing import List, Dict, Optional, Tuple, Union
 from exo.networking import Discovery, PeerHandle, Server
 from exo.inference.inference_engine import InferenceEngine, Shard
+from exo.networking.udp.metrics_udp_discovery import MetricsUDPDiscovery
+from exo.topology.work_stealing_partitioning_strategy import WorkStealingPartitioningStrategy
 from .node import Node
 from exo.topology.topology import Topology
 from exo.topology.device_capabilities import device_capabilities
@@ -27,6 +29,7 @@ class StandardNode(Node):
     partitioning_strategy: PartitioningStrategy = None,
     max_generate_tokens: int = 1024,
     topology_viz: Optional[TopologyViz] = None,
+    memory_for_layer : float = 500
   ):
     self.id = _id
     self.inference_engine = inference_engine
@@ -43,7 +46,17 @@ class StandardNode(Node):
     self._on_opaque_status = AsyncCallbackSystem[str, Tuple[str, str]]()
     self._on_opaque_status.register("node_status").on_next(self.on_node_status)
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
+    self.is_active = True
+    self.work_done = 0
+    self.memory_for_layer = memory_for_layer
+    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+        self.partitioning_strategy.memory_for_layer = self.memory_for_layer
 
+  def update_memory_for_layer(self, new_memory_for_layer: float):
+      self.memory_for_layer = new_memory_for_layer
+      if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+          self.partitioning_strategy.memory_for_layer = self.memory_for_layer
+        
   async def start(self, wait_for_peers: int = 0) -> None:
     await self.server.start()
     await self.discovery.start()
@@ -78,6 +91,10 @@ class StandardNode(Node):
 
   async def process_prompt(self, base_shard: Shard, prompt: str, image_str: Optional[str] = None, request_id: Optional[str] = None, inference_state: Optional[str] = None) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
+    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+      shard = await self.partitioning_strategy.get_work(self.id)
+      if shard is None:
+          shard = self.get_current_shard(base_shard)
     asyncio.create_task(
       self.broadcast_opaque_status(
         request_id,
@@ -119,6 +136,16 @@ class StandardNode(Node):
     return resp
 
   async def _process_prompt(self, base_shard: Shard, prompt: str, image_str: Optional[str] = None, request_id: Optional[str] = None, inference_state: Optional[str] = None) -> Optional[np.ndarray]:
+    if not self.is_active:
+        print(f"Node {self.id} is inactive and cannot process prompt.")
+        return None
+    # Check memory constraints
+    required_memory = self.estimate_memory_usage(base_shard)
+    if required_memory > self.device_capabilities.memory:
+        print(f"Node {self.id} cannot process prompt due to memory constraints.")
+        return None
+    # Proceed with existing logic
+    shard = self.get_current_shard(base_shard)
     if request_id is None:
       request_id = str(uuid.uuid4())
     if request_id not in self.buffered_token_output:
@@ -155,7 +182,19 @@ class StandardNode(Node):
     request_id: Optional[str] = None,
     inference_state: Optional[str] = None,
   ) -> Optional[np.ndarray]:
+    # Check if node is active
+    if not self.is_active:
+        print(f"Node {self.id} is inactive and cannot process tensor.")
+        return None
+      # Check memory constraints
+    required_memory = self.estimate_memory_usage(base_shard)
+    if required_memory > self.device_capabilities.memory:
+          print(f"Node {self.id} cannot process tensor due to memory constraints.")
+          return None
     shard = self.get_current_shard(base_shard)
+    if(isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy)):
+      shard = await self.partitioning_strategy.get_work(self.id)
+
     asyncio.create_task(
       self.broadcast_opaque_status(
         request_id,
@@ -191,8 +230,15 @@ class StandardNode(Node):
         }),
       )
     )
+    self.work_done += 1
     return resp
 
+  def estimate_memory_usage(self, shard: Shard) -> int:
+    # Estimate memory usage based on the shard
+    shard_size = shard.end_layer - shard.start_layer + 1
+    memory_usage = shard_size * self.memory_for_layer  # Total memory usage in MB
+    return memory_usage
+  
   async def _process_tensor(
     self,
     base_shard: Shard,
@@ -261,6 +307,9 @@ class StandardNode(Node):
       target_peer = next((p for p in self.peers if p.id() == next_partition.node_id), None)
       if not target_peer:
         raise ValueError(f"Peer for {next_partition} not found")
+      
+      if(isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy)):
+        await self.partitioning_strategy.add_work(next_partition.node_id, next_shard)
 
       if DEBUG >= 1: print(f"Sending tensor_or_prompt to {target_peer.id()}: {tensor_or_prompt}")
 
@@ -338,6 +387,12 @@ class StandardNode(Node):
     self.peers = next_peers
     return len(peers_added) > 0 or len(peers_removed) > 0 or len(peers_updated) > 0
 
+  async def update_network_metrics(self):
+    if isinstance(self.discovery, MetricsUDPDiscovery):
+      await self.discovery.update_network_metrics(self.peers)
+      self.topology = self.discovery.get_topology()
+      if DEBUG >= 2: print(f"Updated network metrics: {self.topology}")
+
   async def periodic_topology_collection(self, interval: int):
     while True:
       await asyncio.sleep(interval)
@@ -346,6 +401,7 @@ class StandardNode(Node):
         if DEBUG >= 2: print(f"{did_peers_change=}")
         if did_peers_change:
           await self.collect_topology()
+          await self.update_network_metrics()
       except Exception as e:
         print(f"Error collecting topology: {e}")
         traceback.print_exc()
@@ -380,6 +436,7 @@ class StandardNode(Node):
         other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=5.0)
         if DEBUG >= 2: print(f"Collected topology from: {peer.id()}: {other_topology}")
         self.topology.merge(other_topology)
+        #next_topology.merge(other_topology) # Atomic Update
       except Exception as e:
         print(f"Error collecting topology from {peer.id()}: {e}")
 

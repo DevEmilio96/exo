@@ -26,7 +26,7 @@ class DeviceCapabilities:
   chip: str
   memory: int
   flops: DeviceFlops
-
+  power_usage: float = 0.0
   def __str__(self):
     return f"Model: {self.model}. Chip: {self.chip}. Memory: {self.memory}MB. Flops: {self.flops}"
 
