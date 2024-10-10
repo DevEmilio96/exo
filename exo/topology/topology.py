@@ -7,7 +7,6 @@ class Topology:
     self.peer_graph: Dict[str, Set[str]] = {}  # Adjacency list representing the graph
     self.active_node_id: Optional[str] = None
     self.latencies: Dict[Tuple[str, str], float] = {}
-    self.throughputs: Dict[Tuple[str, str], float] = {}
     self.ring: List[str] = []
 
   def update_node(self, node_id: str, device_capabilities: DeviceCapabilities):
@@ -20,15 +19,6 @@ class Topology:
 
   def get_latency(self, node1_id: str, node2_id: str) -> float:
     return self.latencies.get((node1_id, node2_id), float('inf'))
-
-  def get_throughput(self, node1_id: str, node2_id: str) -> float:
-    return self.throughputs.get((node1_id, node2_id), 0.0)
-    
-  def get_average_throughput(self, node_id: str) -> float:
-    neighbors = self.get_neighbors(node_id)
-    if not neighbors:
-        return 0.0
-    return sum(self.get_throughput(node_id, neighbor) for neighbor in neighbors) / len(neighbors)
     
   def get_average_latency(self, node_id: str) -> float:
     neighbors = self.get_neighbors(node_id)
