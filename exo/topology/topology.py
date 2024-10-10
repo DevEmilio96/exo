@@ -29,16 +29,16 @@ class Topology:
   def all_nodes(self):
     return self.nodes.items()
 
-  def add_edge(self, node1_id: str, node2_id: str, latency: float = 0.0, throughput: float = 0.0):
+  def add_edge(self, node1_id: str, node2_id: str, latency: float = 0.0):
     if node1_id not in self.peer_graph:
       self.peer_graph[node1_id] = set()
     if node2_id not in self.peer_graph:
       self.peer_graph[node2_id] = set()
     self.peer_graph[node1_id].add(node2_id)
     self.peer_graph[node2_id].add(node1_id)
-    self.update_edge(node1_id, node2_id, latency, throughput)
+    self.update_edge(node1_id, node2_id, latency)
 
-  def update_edge(self, node1_id: str, node2_id: str, latency: float = 0.0, throughput: float = 0.0):
+  def update_edge(self, node1_id: str, node2_id: str, latency: float = 0.0):
     self.latencies[(node1_id, node2_id)] = self.latencies[(node2_id, node1_id)] = latency
 
   def get_neighbors(self, node_id: str) -> Set[str]:
@@ -58,8 +58,7 @@ class Topology:
     for node_id, neighbors in other.peer_graph.items():
       for neighbor in neighbors:
          latency = other.get_latency(node_id, neighbor)
-         throughput = other.get_throughput(node_id, neighbor)
-         self.add_edge(node_id, neighbor, latency, throughput)
+         self.add_edge(node_id, neighbor, latency)
 
   def __str__(self):
     nodes_str = ", ".join(f"{node_id}: {cap}" for node_id, cap in self.nodes.items())
