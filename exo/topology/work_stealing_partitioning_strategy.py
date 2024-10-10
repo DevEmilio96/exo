@@ -10,8 +10,8 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
         self.node_capabilities: Dict[str, float] = {}
         self.locks: Dict[str, asyncio.Lock] = {}
         self.active_nodes: Set[str] = set()
-        self.topology: Optional[Topology] = None  # Added to access latency and FLOPS
-        self.memory_for_layer: float = 500  # Valore di default
+        self.topology: Optional[Topology] = None
+        self.memory_for_layer: float = 500  # Default value
 
     def partition(self, topology: Topology) -> List[Partition]:
         self.topology = topology
@@ -19,6 +19,7 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
         total_capability = sum(self._calculate_node_capability(node_id) for node_id in nodes)
         partitions = []
         cumulative = 0.0
+        
         for node_id in nodes:
             capability = self._calculate_node_capability(node_id) / total_capability
             self.work_queue[node_id] = []
@@ -27,8 +28,14 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
             self.active_nodes.add(node_id)
             partitions.append(Partition(node_id=node_id, start=cumulative, end=cumulative + capability))
             cumulative += capability
+        
+        # Ensure all nodes in the topology have a partition
+        for node_id in topology.nodes.keys():
+            if node_id not in [p.node_id for p in partitions]:
+                partitions.append(Partition(node_id=node_id, start=cumulative, end=cumulative))
+                cumulative += 1e-10  # Add a small value to ensure unique end points
+        
         return partitions
-
 
     def add_shards(self, shards: List[Shard]):
         if not self.active_nodes:
@@ -58,24 +65,24 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
             self.work_queue[node_id].append(shard)
             work_assigned[node_id] += work
 
-
-
     async def get_work(self, node_id: str) -> Optional[Shard]:
+        if node_id not in self.active_nodes:
+            print(f"Warning: Node {node_id} is not in active_nodes. Adding it.")
+            self.active_nodes.add(node_id)
+            self.work_queue[node_id] = []
+            self.locks[node_id] = asyncio.Lock()
+            self.node_capabilities[node_id] = self._calculate_node_capability(node_id)
+
         async with self.locks[node_id]:
             my_work_count = len(self.work_queue.get(node_id, []))
-            # If the node has less than a threshold of work, attempt to steal
             if my_work_count <= 2:
-                # Attempt to steal work from other nodes
                 node_work_counts = {nid: len(self.work_queue.get(nid, [])) for nid in self.active_nodes}
                 potential_donors = [
                     nid for nid in self.active_nodes
                     if nid != node_id and node_work_counts.get(nid, 0) > my_work_count
                 ]
 
-                # Sort donors by work count descending
-                potential_donors.sort(
-                    key=lambda nid: -node_work_counts.get(nid, 0)
-                )
+                potential_donors.sort(key=lambda nid: -node_work_counts.get(nid, 0))
 
                 for donor_node_id in potential_donors:
                     async with self.locks[donor_node_id]:
@@ -83,27 +90,40 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
                         if donor_work_count > my_work_count:
                             stolen_shard = self.work_queue[donor_node_id].pop(0)
                             print(f"Node {node_id} stole work from {donor_node_id}")
-                            print(f"Work distribution: {node_work_counts}")                   
+                            print(f"Work distribution: {node_work_counts}")
                             return stolen_shard
-        # If no work was stolen or node has enough work, process own queue
-        async with self.locks[node_id]:
+
             if self.work_queue.get(node_id):
                 return self.work_queue[node_id].pop()
         return None
 
     async def add_work(self, node_id: str, shard: Shard):
-        if node_id in self.active_nodes:
-            async with self.locks[node_id]:
-                self.work_queue[node_id].append(shard)
-                
+        if node_id not in self.active_nodes:
+            print(f"Warning: Adding work to inactive node {node_id}. Activating it.")
+            self.active_nodes.add(node_id)
+            self.work_queue[node_id] = []
+            self.locks[node_id] = asyncio.Lock()
+            self.node_capabilities[node_id] = self._calculate_node_capability(node_id)
+
+        async with self.locks[node_id]:
+            self.work_queue[node_id].append(shard)
+
     def is_work_remaining(self) -> bool:
         return any(
-            self.work_queue.get(nid) and self.nodes[nid].is_active
+            self.work_queue.get(nid) and self.topology.nodes[nid].is_active
             for nid in self.active_nodes
         )
-    
+
     def _calculate_node_capability(self, node_id: str) -> float:
         node = self.topology.nodes[node_id]
         flops_factor = node.flops.fp16
         memory_factor = node.memory / self.memory_for_layer
         return flops_factor * memory_factor
+
+    def ensure_node_initialized(self, node_id: str):
+        if node_id not in self.active_nodes:
+            print(f"Initializing node {node_id}")
+            self.active_nodes.add(node_id)
+            self.work_queue[node_id] = []
+            self.locks[node_id] = asyncio.Lock()
+            self.node_capabilities[node_id] = self._calculate_node_capability(node_id)
