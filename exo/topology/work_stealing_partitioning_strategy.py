@@ -40,7 +40,7 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
                 cumulative += node_partition
 
         print(partitions)
-        return [Partition(node_id='d8c12d93-19d4-4cf8-83ad-10c42b50d320', start=0.0, end=0.99), Partition(node_id='385feab5-355f-4247-ba00-e3b41f99e7a8', start=0.99, end=1.0)]
+        return partitions
 
     def _initialize_node(self, node_id: str, capability: float):
         self.work_queue[node_id] = []
