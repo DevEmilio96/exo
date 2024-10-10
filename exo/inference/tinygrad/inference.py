@@ -54,38 +54,70 @@ class TinygradDynamicShardInferenceEngine(InferenceEngine):
     self.shard = None
     self.shard_downloader = shard_downloader
     self.executor = ThreadPoolExecutor(max_workers=1)
+    self.inference_states = {}
+  def get_inference_state(self, request_id: str) -> Optional[str]:
+    state_dict = self.inference_states.get(request_id, {})
+    return json.dumps(state_dict)
+  async def infer_prompt(
+        self,
+        request_id: str,
+        shard: Shard,
+        prompt: str,
+        image_str: Optional[str] = None,
+        inference_state: Optional[str] = None,
+    ) -> Tuple[np.ndarray, str, bool]:
+        await self.ensure_shard(shard)
+        state_dict = json.loads(inference_state or "{}")
+        start_pos = state_dict.get("start_pos", 0)
+        n_captured_toks = state_dict.get("n_captured_toks", 0)
+        self.inference_states[request_id] = state_dict
 
-  async def infer_prompt(self, request_id: str, shard: Shard, prompt: str, image_str: Optional[str] = None, inference_state: Optional[str] = None) -> (np.ndarray, str, bool):
-    await self.ensure_shard(shard)
-    start_pos = json.loads(inference_state or "{}").get("start_pos", 0)
-    n_captured_toks = json.loads(inference_state or "{}").get("n_captured_toks", 0)
+        toks = await asyncio.get_event_loop().run_in_executor(self.executor, self.tokenizer.encode, prompt)
+        h = await asyncio.get_event_loop().run_in_executor(
+            self.executor, lambda: self.model(Tensor([toks]), start_pos, TEMPERATURE).realize()
+        )
 
-    toks = await asyncio.get_event_loop().run_in_executor(self.executor, self.tokenizer.encode, prompt)
-    h = await asyncio.get_event_loop().run_in_executor(self.executor, lambda: self.model(Tensor([toks]), start_pos, TEMPERATURE).realize())
+        if h.shape == (1,):
+            start_pos += len(toks)
+            start_pos += 1
+            n_captured_toks = 0
+            state_dict.update({"start_pos": start_pos, "n_captured_toks": n_captured_toks})
+            self.inference_states[request_id] = state_dict
+            return np.array([[h.item()]]), json.dumps(state_dict), h.item() == self.tokenizer.eos_token_id
+        else:
+            n_captured_toks = len(toks)
+            state_dict.update({"start_pos": start_pos, "n_captured_toks": n_captured_toks})
+            self.inference_states[request_id] = state_dict
+            return h.numpy(), json.dumps(state_dict), False
+          
+  async def infer_tensor(
+        self,
+        request_id: str,
+        shard: Shard,
+        input_data: np.ndarray,
+        inference_state: Optional[str] = None,
+    ) -> Tuple[np.ndarray, str, bool]:
+        await self.ensure_shard(shard)
+        state_dict = json.loads(inference_state or "{}")
+        start_pos = state_dict.get("start_pos", 0)
+        n_captured_toks = state_dict.get("n_captured_toks", 0)
+        self.inference_states[request_id] = state_dict
 
-    if h.shape == (1,):
-      start_pos += len(toks)
-      start_pos += 1
-      n_captured_toks = 0
-      return np.array([[h.item()]]), json.dumps({"start_pos": start_pos, "n_captured_toks": n_captured_toks}), h.item() == self.tokenizer.eos_token_id
-    else:
-      n_captured_toks = len(toks)
-      return h.numpy(), json.dumps({"start_pos": start_pos, "n_captured_toks": n_captured_toks}), False
+        h = await asyncio.get_event_loop().run_in_executor(
+            self.executor, lambda: self.model(Tensor(input_data), start_pos, TEMPERATURE).realize()
+        )
 
-  async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[str] = None) -> Tuple[np.ndarray, str, bool]:
-    await self.ensure_shard(shard)
-    start_pos = json.loads(inference_state or "{}").get("start_pos", 0)
-    n_captured_toks = json.loads(inference_state or "{}").get("n_captured_toks", 0)
-
-    h = await asyncio.get_event_loop().run_in_executor(self.executor, lambda: self.model(Tensor(input_data), start_pos, TEMPERATURE).realize())
-
-    if h.shape == (1,):
-      start_pos += n_captured_toks
-      start_pos += 1
-      n_captured_toks = 0
-      return np.array([[h.item()]]), json.dumps({"start_pos": start_pos, "n_captured_toks": n_captured_toks}), h.item() == self.tokenizer.eos_token_id
-    else:
-      return h.numpy(), json.dumps({"start_pos": start_pos, "n_captured_toks": n_captured_toks}), False
+        if h.shape == (1,):
+            start_pos += n_captured_toks
+            start_pos += 1
+            n_captured_toks = 0
+            state_dict.update({"start_pos": start_pos, "n_captured_toks": n_captured_toks})
+            self.inference_states[request_id] = state_dict
+            return np.array([[h.item()]]), json.dumps(state_dict), h.item() == self.tokenizer.eos_token_id
+        else:
+            state_dict.update({"start_pos": start_pos, "n_captured_toks": n_captured_toks})
+            self.inference_states[request_id] = state_dict
+            return h.numpy(), json.dumps(state_dict), False
 
   async def ensure_shard(self, shard: Shard):
     if self.shard == shard:

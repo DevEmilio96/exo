@@ -12,66 +12,94 @@ from exo.orchestration import Node
 
 class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
   def __init__(self, node: Node, host: str, port: int):
-    self.node = node
-    self.host = host
-    self.port = port
-    self.server = None
+      self.node = node
+      self.host = host
+      self.port = port
+      self.server = None
 
   async def start(self) -> None:
-    self.server = grpc.aio.server(
-      futures.ThreadPoolExecutor(max_workers=10),
-      options=[
-        ("grpc.max_metadata_size", 32*1024*1024),
-        ("grpc.max_send_message_length", 128*1024*1024),
-        ("grpc.max_receive_message_length", 128*1024*1024),
-      ],
-    )
-    node_service_pb2_grpc.add_NodeServiceServicer_to_server(self, self.server)
-    listen_addr = f"{self.host}:{self.port}"
-    self.server.add_insecure_port(listen_addr)
-    await self.server.start()
-    if DEBUG >= 1: print(f"Server started, listening on {listen_addr}")
+      self.server = grpc.aio.server(
+          futures.ThreadPoolExecutor(max_workers=10),
+          options=[
+              ("grpc.max_metadata_size", 32*1024*1024),
+              ("grpc.max_send_message_length", 128*1024*1024),
+              ("grpc.max_receive_message_length", 128*1024*1024),
+          ],
+      )
+      node_service_pb2_grpc.add_NodeServiceServicer_to_server(self, self.server)
+      listen_addr = f"{self.host}:{self.port}"
+      self.server.add_insecure_port(listen_addr)
+      await self.server.start()
+      if DEBUG >= 1:
+          print(f"Server started, listening on {listen_addr}")
 
   async def stop(self) -> None:
-    if self.server:
-      try:
-        await self.server.stop(grace=5)
-        await self.server.wait_for_termination()
-      except CancelledError:
-        pass
-      if DEBUG >= 1: print("Server stopped and all connections are closed")
+      if self.server:
+          try:
+              await self.server.stop(grace=5)
+              await self.server.wait_for_termination()
+          except CancelledError:
+              pass
+          if DEBUG >= 1:
+              print("Server stopped and all connections are closed")
 
   async def SendPrompt(self, request, context):
-    shard = Shard(
-      model_id=request.shard.model_id,
-      start_layer=request.shard.start_layer,
-      end_layer=request.shard.end_layer,
-      n_layers=request.shard.n_layers,
-    )
-    prompt = request.prompt
-    image_str = request.image_str
-    request_id = request.request_id
-    result = await self.node.process_prompt(shard, prompt, image_str, request_id)
-    if DEBUG >= 5: print(f"SendPrompt {shard=} {prompt=} {image_str=} {request_id=} result: {result}")
-    tensor_data = result.tobytes() if result is not None else None
-    return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
+      shard = Shard(
+          model_id=request.shard.model_id,
+          start_layer=request.shard.start_layer,
+          end_layer=request.shard.end_layer,
+          n_layers=request.shard.n_layers,
+      )
+      prompt = request.prompt
+      image_str = request.image_str
+      request_id = request.request_id
+      inference_state = request.inference_state  # Extract inference_state
+
+      # Pass inference_state to process_prompt
+      result = await self.node.process_prompt(shard, prompt, image_str, request_id, inference_state)
+      if DEBUG >= 5:
+          print(f"SendPrompt {shard=} {prompt=} {image_str=} {request_id=} {inference_state=} result: {result}")
+
+      if result is not None:
+          tensor_data = result.tobytes()
+          response = node_service_pb2.PromptResponse(
+              tensor_data=tensor_data,
+              shape=result.shape,
+              dtype=str(result.dtype)
+          )
+      else:
+          response = node_service_pb2.PromptResponse()
+
+      return response
 
   async def SendTensor(self, request, context):
-    shard = Shard(
-      model_id=request.shard.model_id,
-      start_layer=request.shard.start_layer,
-      end_layer=request.shard.end_layer,
-      n_layers=request.shard.n_layers,
-    )
-    tensor = np.frombuffer(request.tensor.tensor_data, dtype=np.dtype(request.tensor.dtype)).reshape(request.tensor.shape)
-    request_id = request.request_id
-    inference_state = request.inference_state
+      shard = Shard(
+          model_id=request.shard.model_id,
+          start_layer=request.shard.start_layer,
+          end_layer=request.shard.end_layer,
+          n_layers=request.shard.n_layers,
+      )
+      tensor = np.frombuffer(request.tensor.tensor_data, dtype=np.dtype(request.tensor.dtype)).reshape(request.tensor.shape)
+      request_id = request.request_id
+      inference_state = request.inference_state  # Extract inference_state
 
-    result = await self.node.process_tensor(shard, tensor, request_id, inference_state)
-    if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} result: {result}")
-    tensor_data = result.tobytes() if result is not None else None
-    return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
+      # Pass inference_state to process_tensor
+      result = await self.node.process_tensor(shard, tensor, request_id, inference_state)
+      if DEBUG >= 5:
+          print(f"SendTensor {shard=} {tensor=} {request_id=} {inference_state=} result: {result}")
 
+      if result is not None:
+          tensor_data = result.tobytes()
+          response = node_service_pb2.TensorResponse(
+              tensor_data=tensor_data,
+              shape=result.shape,
+              dtype=str(result.dtype)
+          )
+      else:
+          response = node_service_pb2.TensorResponse()
+
+      return response
+  
   async def GetInferenceResult(self, request, context):
     request_id = request.request_id
     result = await self.node.get_inference_result(request_id)
