@@ -90,6 +90,11 @@ class StandardNode(Node):
       if DEBUG >= 1: traceback.print_exc()
 
   async def process_prompt(self, base_shard: Shard, prompt: str, image_str: Optional[str] = None, request_id: Optional[str] = None, inference_state: Optional[str] = None) -> Optional[np.ndarray]:
+    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+        # Ensure that the base_shard is added to the work_queue
+        if not self.partitioning_strategy.is_work_remaining():
+            self.partitioning_strategy.add_shards([base_shard])
+
     shard = self.get_current_shard(base_shard)
     if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
       shard = await self.partitioning_strategy.get_work(self.id)
@@ -182,20 +187,25 @@ class StandardNode(Node):
     request_id: Optional[str] = None,
     inference_state: Optional[str] = None,
   ) -> Optional[np.ndarray]:
-    # Check if node is active
     if not self.is_active:
         print(f"Node {self.id} is inactive and cannot process tensor.")
         return None
-      # Check memory constraints
+
     required_memory = self.estimate_memory_usage(base_shard)
     if required_memory > self.device_capabilities.memory:
-          print(f"Node {self.id} cannot process tensor due to memory constraints.")
-          return None
+        print(f"Node {self.id} cannot process tensor due to memory constraints.")
+        return None
+
+    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+        # Ensure that the base_shard is added to the work_queue
+        if not self.partitioning_strategy.is_work_remaining():
+            self.partitioning_strategy.add_shards([base_shard])
+
     shard = self.get_current_shard(base_shard)
-    if(isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy)):
-      shard = await self.partitioning_strategy.get_work(self.id)
-      if shard is None:
-          shard = shard = self.get_current_shard(base_shard)
+    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
+        shard = await self.partitioning_strategy.get_work(self.id)
+        if shard is None:
+            shard = self.get_current_shard(base_shard)
     asyncio.create_task(
       self.broadcast_opaque_status(
         request_id,
