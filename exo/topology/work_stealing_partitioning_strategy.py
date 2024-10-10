@@ -66,6 +66,29 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
             work_assigned[node_id] += work
 
     async def get_work(self, node_id: str) -> Optional[Shard]:
+        node_capabilities = self.topology.get_node(node_id)
+        if not node_capabilities:
+            print(f"Node {node_id} capabilities not found in topology.")
+            return None
+
+        print(f"Node {node_id} capabilities: Memory={node_capabilities.memory} MB")
+
+        # Log the current work queue
+        print(f"Current work queue has {len(self.work_queue)} shards.")
+
+        # Iterate through the work queue to find a suitable shard
+        for shard in self.work_queue:
+            required_memory = self.estimate_memory_usage(shard)
+            print(f"Evaluating shard {shard}: requires {required_memory} MB memory.")
+
+            if required_memory <= node_capabilities.memory:
+                print(f"Assigning shard {shard} to node {node_id}.")
+                self.work_queue.remove(shard)
+                return shard
+            else:
+                print(f"Shard {shard} requires more memory than node {node_id} has.")
+
+        print(f"No suitable shard found for node {node_id} due to memory constraints.")
         if node_id not in self.active_nodes:
             print(f"Warning: Node {node_id} is not in active_nodes. Adding it.")
             self.active_nodes.add(node_id)

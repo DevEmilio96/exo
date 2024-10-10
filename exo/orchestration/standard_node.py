@@ -112,6 +112,8 @@ class StandardNode(Node):
           if shard is None:
               print(f"No work available for node {self.id}")
               return None
+          else:
+              print(f"Node {self.id} received shard {shard}")
 
       asyncio.create_task(
           self.broadcast_opaque_status(
@@ -234,6 +236,8 @@ class StandardNode(Node):
         if shard is None:
             print(f"No work available for node {self.id}")
             return None
+        else:
+            print(f"Node {self.id} received shard {shard}")
 
     asyncio.create_task(
         self.broadcast_opaque_status(
@@ -278,6 +282,7 @@ class StandardNode(Node):
     # Estimate memory usage based on the shard
     shard_size = shard.end_layer - shard.start_layer + 1
     memory_usage = shard_size * self.memory_for_layer  # Total memory usage in MB
+    print(f"Estimating memory usage for shard {shard}: {shard_size} layers * {self.memory_for_layer} MB/layer = {memory_usage} MB")
     return memory_usage
   
   async def _process_tensor(
@@ -459,6 +464,7 @@ class StandardNode(Node):
   async def collect_topology(self, visited: set[str] = set(), max_depth: int = 4) -> Topology:
     next_topology = Topology()
     next_topology.update_node(self.id, self.device_capabilities)
+    print(f"Collecting topology. Node {self.id} has capabilities: Memory={self.device_capabilities.memory} MB")
 
     if DEBUG >= 2: print(f"Collecting topology {max_depth=} {visited=}")
 
