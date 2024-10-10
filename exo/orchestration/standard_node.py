@@ -194,7 +194,8 @@ class StandardNode(Node):
     shard = self.get_current_shard(base_shard)
     if(isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy)):
       shard = await self.partitioning_strategy.get_work(self.id)
-
+      if shard is None:
+          shard = shard = self.get_current_shard(base_shard)
     asyncio.create_task(
       self.broadcast_opaque_status(
         request_id,

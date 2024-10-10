@@ -234,9 +234,9 @@ class ChatGPTAPI:
     if not chat_request.model or chat_request.model not in model_base_shards:
       if DEBUG >= 1: print(f"Invalid model: {chat_request.model}. Supported: {list(model_base_shards.keys())}. Defaulting to llama-3.1-8b")
       chat_request.model = "llama-3.1-8b"
-      if isinstance(self.node, StandardNode):
-          new_memory_for_layer = update_memory_for_layer(chat_request.model, self.inference_engine_classname)
-          self.node.update_memory_for_layer(new_memory_for_layer)
+    if isinstance(self.node, StandardNode):
+        new_memory_for_layer = update_memory_for_layer(chat_request.model, self.inference_engine_classname)
+        self.node.update_memory_for_layer(new_memory_for_layer)
     shard = model_base_shards[chat_request.model].get(self.inference_engine_classname, None)
     if not shard:
       supported_models = [model for model, engines in model_base_shards.items() if self.inference_engine_classname in engines]
