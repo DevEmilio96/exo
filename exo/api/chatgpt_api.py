@@ -236,7 +236,7 @@ class ChatGPTAPI:
       chat_request.model = "llama-3.1-8b"
     if isinstance(self.node, StandardNode):
         new_memory_for_layer = update_memory_for_layer(chat_request.model, self.inference_engine_classname)
-        self.node.update_memory_for_layer(new_memory_for_layer)
+        self.node.memory_for_layer = new_memory_for_layer
     shard = model_base_shards[chat_request.model].get(self.inference_engine_classname, None)
     if not shard:
       supported_models = [model for model, engines in model_base_shards.items() if self.inference_engine_classname in engines]
