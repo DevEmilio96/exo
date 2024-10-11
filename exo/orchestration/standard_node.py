@@ -49,14 +49,7 @@ class StandardNode(Node):
     self.is_active = True
     self.work_done = 0
     self.memory_for_layer = memory_for_layer
-    if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
-        self.partitioning_strategy.memory_for_layer = self.memory_for_layer
 
-  def update_memory_for_layer(self, new_memory_for_layer: float):
-      self.memory_for_layer = new_memory_for_layer
-      if isinstance(self.partitioning_strategy, WorkStealingPartitioningStrategy):
-          self.partitioning_strategy.memory_for_layer = self.memory_for_layer
-        
   async def start(self, wait_for_peers: int = 0) -> None:
     await self.server.start()
     await self.discovery.start()
@@ -139,12 +132,7 @@ class StandardNode(Node):
     if not self.is_active:
         print(f"Node {self.id} is inactive and cannot process prompt.")
         return None
-    # Check memory constraints
-    required_memory = self.estimate_memory_usage(base_shard)
-    if required_memory > self.device_capabilities.memory:
-        print(f"Node {self.id} cannot process prompt due to memory constraints.")
-        return None
-    # Proceed with existing logic
+
     shard = self.get_current_shard(base_shard)
     if request_id is None:
       request_id = str(uuid.uuid4())

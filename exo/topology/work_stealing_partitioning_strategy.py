@@ -1,5 +1,4 @@
 import asyncio
-import math
 from typing import List, Dict, Optional, Set
 from exo.topology.partitioning_strategy import PartitioningStrategy, Partition
 from exo.topology.topology import Topology
@@ -15,7 +14,6 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
         self.locks: Dict[str, asyncio.Lock] = {}
         self.active_nodes: Set[str] = set()
         self.topology: Optional[Topology] = None
-        self.memory_for_layer: float = 500  # Default value
 
     def partition(self, topology: Topology) -> List[Partition]:
         self.topology = topology
@@ -39,7 +37,7 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
                 self._initialize_node(node_id, node_partition)
                 cumulative += node_partition
 
-        print(partitions)
+        logger.debug(f"Partitions: {partitions}")
         return partitions
 
     def _initialize_node(self, node_id: str, capability: float):
@@ -47,42 +45,6 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
         self.locks[node_id] = asyncio.Lock()
         self.node_capabilities[node_id] = capability
         self.active_nodes.add(node_id)
-
-    def add_shards(self, shards: List[Shard]):
-        if not self.active_nodes:
-            raise Exception("No active nodes available to assign shards.")
-
-        shard_work = [shard.end_layer - shard.start_layer + 1 for shard in shards]
-        total_work = sum(shard_work)
-        total_capability = sum(self.node_capabilities.values())
-
-        if total_capability <= 0:
-            logger.warning("Total capability is zero or negative. Distributing work equally.")
-            work_per_node = len(shards) / len(self.active_nodes)
-            for i, node_id in enumerate(self.active_nodes):
-                start = int(i * work_per_node)
-                end = int((i + 1) * work_per_node)
-                self.work_queue[node_id].extend(shards[start:end])
-        else:
-            target_work_per_node = {
-                node_id: (self.node_capabilities[node_id] / total_capability) * total_work
-                for node_id in self.active_nodes
-            }
-
-            shards_with_work = list(zip(shards, shard_work))
-            work_assigned = {node_id: 0 for node_id in self.active_nodes}
-
-            for shard, work in shards_with_work:
-                node_id = min(
-                    self.active_nodes,
-                    key=lambda nid: (
-                        work_assigned[nid] / max(target_work_per_node[nid], 1e-10),
-                        self.topology.get_average_latency(nid),
-                        -self.topology.nodes[nid].memory / max(self.memory_for_layer, 1e-10)
-                    )
-                )
-                self.work_queue[node_id].append(shard)
-                work_assigned[node_id] += work
 
     async def get_work(self, node_id: str) -> Optional[Shard]:
         async with self.locks[node_id]:
@@ -106,7 +68,7 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
                             return stolen_shard
 
             if self.work_queue.get(node_id):
-                return self.work_queue[node_id].pop()
+                return self.work_queue[node_id].pop(0)
 
         return None
 
@@ -123,12 +85,6 @@ class WorkStealingPartitioningStrategy(PartitioningStrategy):
 
     def _calculate_node_capability(self, node_id: str) -> float:
         node = self.topology.nodes[node_id]
-        flops_factor = max(node.flops.fp16, 1e-10)
-        
-        # Nuovo calcolo del memory_factor
-        available_layers = node.memory / max(self.memory_for_layer, 1e-10)
-        memory_factor = 1 - math.exp(-available_layers / 10)  # Usiamo una funzione esponenziale per limitare la crescita
-        
-        capability = flops_factor * memory_factor
-        logger.debug(f"Node {node_id} capability: {capability:.5f} (FLOPS: {flops_factor:.2f}, memory_factor: {memory_factor:.5f}, memory: {node.memory}, memory_for_layer: {self.memory_for_layer})")
+        capability = node.flops.fp16
+        logger.debug(f"Node {node_id} capability: {capability:.5f} (FLOPS: {capability:.2f})")
         return capability

@@ -36,7 +36,6 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.topology = Topology()
-        # Initialize in each test case
         self.nodes = {}
         self.ring_strategy = RingMemoryWeightedPartitioningStrategy()
         self.work_stealing_strategy = WorkStealingPartitioningStrategy()
@@ -49,14 +48,15 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             self.topology.update_node(node_id, capabilities)
 
         for edge in edge_configs:
-            self.topology.add_edge(edge['from'], edge['to'], latency=edge['latency'], throughput=edge['throughput'])
+            self.topology.add_edge(edge['from'], edge['to'], latency=edge['latency'])
 
     async def run_simulation(self, strategy, shards: List[Shard]) -> Tuple[float, float]:
         start_time = asyncio.get_event_loop().time()
 
         partitions = strategy.partition(self.topology)
         if isinstance(strategy, WorkStealingPartitioningStrategy):
-            strategy.add_shards(shards)
+            for shard in shards:
+                await strategy.add_work(list(self.nodes.keys())[0], shard)  # Add all shards to the first node
             tasks = [self.process_node_work_stealing(node_id, strategy) for node_id in self.nodes]
         else:
             node_shards = {node_id: [] for node_id in self.nodes}
@@ -111,8 +111,6 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
                 else:
                     break
             await node.process_shard(shard)
-        # Exit the loop if the node is inactive
-
 
     async def process_node_shards(self, node_id: str, shard_tuples: List[Tuple[Shard, Optional[str]]]):
         node = self.nodes[node_id]
@@ -132,7 +130,7 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             ) for i in range(1, 6)
         }
         edge_configs = [
-            {'from': f"node{i}", 'to': f"node{j}", 'latency': 0.01, 'throughput': 1000}
+            {'from': f"node{i}", 'to': f"node{j}", 'latency': 0.01}
             for i in range(1, 6) for j in range(i+1, 6)
         ]
         await self.setup_scenario(node_configs, edge_configs)
@@ -177,9 +175,9 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             )
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.01, 'throughput': 1000},
-            {'from': "node2", 'to': "node3", 'latency': 0.01, 'throughput': 1000},
-            {'from': "node1", 'to': "node3", 'latency': 0.01, 'throughput': 1000}
+            {'from': "node1", 'to': "node2", 'latency': 0.01},
+            {'from': "node2", 'to': "node3", 'latency': 0.01},
+            {'from': "node1", 'to': "node3", 'latency': 0.01}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
@@ -222,9 +220,9 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             )
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.005, 'throughput': 1000},
-            {'from': "node2", 'to': "node3", 'latency': 0.02, 'throughput': 800},
-            {'from': "node1", 'to': "node3", 'latency': 0.03, 'throughput': 600}
+            {'from': "node1", 'to': "node2", 'latency': 0.005},
+            {'from': "node2", 'to': "node3", 'latency': 0.02},
+            {'from': "node1", 'to': "node3", 'latency': 0.03}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
@@ -267,9 +265,9 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             )
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.01, 'throughput': 1000},
-            {'from': "node2", 'to': "node3", 'latency': 0.01, 'throughput': 1000},
-            {'from': "node1", 'to': "node3", 'latency': 0.01, 'throughput': 1000}
+            {'from': "node1", 'to': "node2", 'latency': 0.01},
+            {'from': "node2", 'to': "node3", 'latency': 0.01},
+            {'from': "node1", 'to': "node3", 'latency': 0.01}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
@@ -314,9 +312,9 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             ) for i in range(1, 4)
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.1, 'throughput': 1000},
-            {'from': "node2", 'to': "node3", 'latency': 0.1, 'throughput': 1000},
-            {'from': "node1", 'to': "node3", 'latency': 0.1, 'throughput': 1000}
+            {'from': "node1", 'to': "node2", 'latency': 0.1},
+            {'from': "node2", 'to': "node3", 'latency': 0.1},
+            {'from': "node1", 'to': "node3", 'latency': 0.1}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
@@ -345,7 +343,7 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             ) for i in range(1, 5)
         }
         edge_configs = [
-            {'from': f"node{i}", 'to': f"node{j}", 'latency': 0.01, 'throughput': 1000}
+            {'from': f"node{i}", 'to': f"node{j}", 'latency': 0.01}
             for i in range(1, 5) for j in range(i+1, 5)
         ]
         await self.setup_scenario(node_configs, edge_configs)
@@ -382,7 +380,7 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             )
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.01, 'throughput': 1000}
+            {'from': "node1", 'to': "node2", 'latency': 0.01}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
@@ -418,7 +416,7 @@ class TestPartitioningStrategies(unittest.IsolatedAsyncioTestCase):
             )
         }
         edge_configs = [
-            {'from': "node1", 'to': "node2", 'latency': 0.01, 'throughput': 1000}
+            {'from': "node1", 'to': "node2", 'latency': 0.01}
         ]
         await self.setup_scenario(node_configs, edge_configs)
 
