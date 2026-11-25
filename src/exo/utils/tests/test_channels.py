@@ -1,0 +1,304 @@
+import ctypes
+import multiprocessing as mp
+import os
+import threading
+import time
+from multiprocessing import queues
+from multiprocessing.connection import Connection
+
+import pytest
+from anyio import (
+    BrokenResourceError,
+    ClosedResourceError,
+    EndOfStream,
+    WouldBlock,
+    fail_after,
+)
+from loguru import logger
+
+from exo.utils.channels import ErrorOverride, MpReceiver, MpSender, channel, mp_channel
+
+
+class CustomClosedResourceError(ClosedResourceError):
+    pass
+
+
+class CustomBrokenResourceError(BrokenResourceError):
+    pass
+
+
+class CustomEndOfStream(EndOfStream):
+    pass
+
+
+class CustomWouldBlock(WouldBlock):
+    pass
+
+
+ERROR_OVERRIDE = ErrorOverride(
+    closed_resource_error=CustomClosedResourceError,
+    broken_resource_error=CustomBrokenResourceError,
+    end_of_stream=CustomEndOfStream,
+    would_block=CustomWouldBlock,
+)
+
+
+def foo(recv: MpReceiver[str]):
+    expected = ["hi", "hi 2", "bye"]
+    with recv as r:
+        for item in r:
+            assert item == expected.pop(0)
+
+
+def bar(send: MpSender[str]):
+    logger.warning("hi")
+    send.send("hi")
+    time.sleep(0.1)
+    logger.warning("hi 2")
+    send.send("hi 2")
+    time.sleep(0.1)
+    logger.warning("bye")
+    send.send("bye")
+    time.sleep(0.1)
+    send.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("send_immediately", [False, True])
+async def test_channel_ipc(send_immediately: bool):
+    with fail_after(0.5):
+        s, r = mp_channel[str](send_immediately=send_immediately)
+        p1 = mp.Process(target=foo, args=(r,))
+        p2 = mp.Process(target=bar, args=(s,))
+        p1.start()
+        p2.start()
+        p1.join()
+        p2.join()
+
+
+def send_then_hold_the_gil(send: MpSender[str]):
+    # Look the function up first: loading a library releases the GIL
+    hold_the_gil = ctypes.PyDLL(None).sleep
+    send.send("status")
+    send.send("acknowledgement")
+    # As MLX's distributed init does while it waits for the other ranks
+    hold_the_gil(60)
+
+
+def receive(recv: MpReceiver[str], count: int, seconds: float) -> list[str]:
+    received: list[str] = []
+    deadline = time.monotonic() + seconds
+    while len(received) < count and time.monotonic() < deadline:
+        try:
+            received.append(recv.receive_nowait())
+        except WouldBlock:
+            time.sleep(0.01)
+    return received
+
+
+def test_what_is_sent_immediately_leaves_before_a_call_that_holds_the_gil():
+    send, recv = mp_channel[str](send_immediately=True)
+    sender = mp.Process(target=send_then_hold_the_gil, args=(send,), daemon=True)
+    sender.start()
+    try:
+        assert receive(recv, 2, 5) == ["status", "acknowledgement"]
+    finally:
+        sender.kill()
+        sender.join()
+        recv.close()
+
+
+def test_closing_wakes_a_reader_of_a_channel_that_sends_immediately():
+    _, recv = mp_channel[str](send_immediately=True)
+    ended = threading.Event()
+
+    def read() -> None:
+        with pytest.raises((EndOfStream, ClosedResourceError)):
+            recv.receive()
+        ended.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    time.sleep(0.1)
+    recv.close()
+    assert ended.wait(2)
+
+
+def test_a_reader_woken_by_close_and_the_closer_both_close_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A runner's supervisor closes its event channel while a worker thread waits in receive():
+    # the end-of-stream marker that close writes wakes that thread, which closes the channel
+    # too. Closing a pipe end is slowed down here to hold both threads in the window that a
+    # busy node hits by chance, where both have seen the pipe open and both close it.
+    def slow_close(connection: Connection) -> None:
+        handle = connection.fileno()
+        time.sleep(0.05)
+        os.close(handle)
+
+    monkeypatch.setattr("multiprocessing.connection.Connection._close", slow_close)
+    _, recv = mp_channel[str](send_immediately=True)
+    errors: list[BaseException] = []
+    waiting = threading.Event()
+
+    def read() -> None:
+        waiting.set()
+        try:
+            recv.receive()
+        except (EndOfStream, ClosedResourceError):
+            pass
+        except BaseException as e:
+            errors.append(e)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    assert waiting.wait(2)
+    time.sleep(0.05)
+    try:
+        recv.close()
+    except BaseException as e:
+        errors.append(e)
+    reader.join(2)
+    assert not reader.is_alive()
+    assert errors == []
+
+
+@pytest.mark.parametrize("send_immediately", [True, False])
+def test_a_receive_that_blocks_on_a_channel_closed_just_before_ends_closed(
+    monkeypatch: pytest.MonkeyPatch, send_immediately: bool
+):
+    # A reader thread finds the channel empty, and the channel is closed before the thread
+    # blocks on it: the queue's get says it is closed (ValueError), which must come out as
+    # ClosedResourceError like any other read of a closed channel.
+    _, recv = mp_channel[int](send_immediately=send_immediately)
+    receive_nowait = recv.receive_nowait
+
+    def empty_then_closed(receiver: MpReceiver[int]) -> int:
+        try:
+            return receive_nowait()
+        finally:
+            receiver.close()
+
+    monkeypatch.setattr(MpReceiver, "receive_nowait", empty_then_closed)
+    with pytest.raises(ClosedResourceError):
+        recv.receive()
+
+
+def test_channel_error_override_replaces_sync_errors_with_subclasses():
+    send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)
+
+    with pytest.raises(CustomWouldBlock) as would_block_info:
+        send.send_nowait(1)
+    assert type(would_block_info.value.__cause__) is WouldBlock
+
+    recv.close()
+    with pytest.raises(CustomBrokenResourceError) as broken_resource_info:
+        send.send_nowait(1)
+    assert type(broken_resource_info.value.__cause__) is BrokenResourceError
+
+    send.close()
+    with pytest.raises(CustomClosedResourceError) as closed_resource_info:
+        send.send_nowait(1)
+    assert type(closed_resource_info.value.__cause__) is ClosedResourceError
+
+
+@pytest.mark.anyio
+async def test_channel_error_override_replaces_async_errors_with_subclasses():
+    send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)
+    recv.close()
+
+    with pytest.raises(CustomBrokenResourceError) as broken_resource_info:
+        await send.send(1)
+    assert type(broken_resource_info.value.__cause__) is BrokenResourceError
+
+    send, recv = channel[int](error_override_config=ERROR_OVERRIDE)
+    send.close()
+    with pytest.raises(CustomEndOfStream) as end_of_stream_info:
+        await recv.receive()
+    assert type(end_of_stream_info.value.__cause__) is EndOfStream
+
+
+@pytest.mark.anyio
+async def test_channel_error_override_is_preserved_by_clones():
+    send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)
+    send_clone = send.clone()
+    recv.close()
+
+    with pytest.raises(CustomBrokenResourceError):
+        await send_clone.send(1)
+
+    send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)
+    cloned_send = recv.clone_sender()
+    recv.close()
+
+    with pytest.raises(CustomBrokenResourceError):
+        await cloned_send.send(1)
+
+
+def test_closing_a_full_channel_that_sends_immediately_does_not_block():
+    send, recv = mp_channel[str](send_immediately=True)
+    # Fill the pipe: nobody is reading
+    with pytest.raises(WouldBlock):
+        for _ in range(1_000_000):
+            send.send_nowait("x" * 200)
+
+    closer = threading.Thread(target=recv.close, daemon=True)
+    closer.start()
+    closer.join(2)
+    assert not closer.is_alive()
+    send.close()
+
+
+@pytest.mark.parametrize("send_immediately", [True, False])
+def test_closing_a_channel_from_several_threads_at_once_closes_it_once(
+    send_immediately: bool,
+):
+    # A receiver's reader thread closes the channel when it reads the end-of-stream
+    # marker that the receiver's own close has just written: two closes at once.
+    # Closing a pipe twice closed its descriptor twice (EBADF, or another file's).
+    failures: list[BaseException] = []
+    for _ in range(50):
+        send, recv = mp_channel[int](send_immediately=send_immediately)
+        start = threading.Barrier(4)
+
+        def close(
+            channel: MpSender[int] | MpReceiver[int], start: threading.Barrier
+        ) -> None:
+            start.wait()
+            try:
+                channel.close()
+            except BaseException as error:  # noqa: BLE001 - recorded, then asserted on
+                failures.append(error)
+
+        closers = [
+            threading.Thread(target=close, args=(c, start))
+            for c in (send, recv, send, recv)
+        ]
+        for closer in closers:
+            closer.start()
+        for closer in closers:
+            closer.join(5)
+    assert failures == []
+
+
+def test_a_close_that_returns_has_closed_the_buffer(monkeypatch: pytest.MonkeyPatch):
+    # When two threads close a sender at once, the one that doesn't close the buffer itself
+    # must still return only once it is closed: joining, as the runner does right after
+    # closing, asserts that the queue is closed.
+    queue_close = queues.Queue[object].close
+    closing = threading.Event()
+
+    def slow_close(queue: queues.Queue[object]) -> None:
+        closing.set()
+        time.sleep(0.1)
+        queue_close(queue)
+
+    monkeypatch.setattr(queues.Queue, "close", slow_close)
+    send, _ = mp_channel[int]()
+    first = threading.Thread(target=send.close)
+    first.start()
+    assert closing.wait(2)
+    send.close()
+    send.join()
+    first.join(2)
+    assert not first.is_alive()

@@ -1,0 +1,96 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3f233048..5e0f8eff 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -186,17 +186,11 @@ if(MLX_BUILD_METAL)
+   # version detection is deferred and the baseline Metal feature set is used.
+   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+     # Get the host macOS version.
+-    execute_process(
+-      COMMAND sw_vers -productVersion
+-      OUTPUT_VARIABLE MACOS_VERSION
+-      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    set(MACOS_VERSION @sdkVersion@)
+     message(STATUS "Building on macOS ${MACOS_VERSION}")
+ 
+     # Get macOS SDK version.
+-    execute_process(
+-      COMMAND xcrun -sdk macosx --show-sdk-version
+-      OUTPUT_VARIABLE MACOS_SDK_VERSION
+-      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    set(MACOS_SDK_VERSION @sdkVersion@)
+     if(MACOS_SDK_VERSION VERSION_LESS 14.0)
+       message(
+         FATAL_ERROR
+@@ -215,12 +209,7 @@ if(MLX_BUILD_METAL)
+ 
+     # Get Metal version.
+     set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+-    execute_process(
+-      COMMAND
+-        zsh "-c"
+-        "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1"
+-      OUTPUT_VARIABLE MLX_METAL_VERSION
+-      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    set(MLX_METAL_VERSION @metalVersion@)
+     message(STATUS "Metal version: ${MLX_METAL_VERSION}")
+   else()
+     set(MLX_METAL_VERSION 0)
+diff --git a/cmake/extension.cmake b/cmake/extension.cmake
+index 1318eb65..f9c501d1 100644
+--- a/cmake/extension.cmake
++++ b/cmake/extension.cmake
+@@ -95,7 +95,8 @@ macro(mlx_build_metallib)
+     add_custom_command(
+       OUTPUT ${_MTLLIB_AIR_TARGET}
+       COMMAND
+-        xcrun -sdk macosx metal ${_MTLLIB_INCLUDE_OPTIONS}
++        metal -fmodules-cache-path=${CMAKE_BINARY_DIR}/metal-cache
++        ${_MTLLIB_INCLUDE_OPTIONS}
+         ${_MTLLIB_COMPILE_OPTIONS} ${MTLLIB_COMPILE_OPTIONS} -MMD -MF
+         ${_MTLLIB_DEPFILE} -MT ${_MTLLIB_AIR_TARGET} -c ${_MTLLIB_SOURCE} -o
+         ${_MTLLIB_AIR_TARGET}
+@@ -111,7 +112,7 @@ macro(mlx_build_metallib)
+   # Link the AIR files into a metallib
+   add_custom_command(
+     OUTPUT ${MTLLIB_BUILD_TARGET}
+-    COMMAND xcrun -sdk macosx metal ${_MTLLIB_LINK_OPTIONS}
++    COMMAND metal ${_MTLLIB_LINK_OPTIONS}
+             ${_MTLLIB_AIR_TARGETS} -o ${MTLLIB_BUILD_TARGET}
+     DEPENDS ${_MTLLIB_AIR_TARGETS}
+     COMMENT "Building ${MTLLIB_TITLE}.metallib"
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index 355c763a..ec375862 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -30,7 +30,7 @@ function(build_kernel_base TARGET SRCFILE DEPS)
+                     "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+   endif()
+   add_custom_command(
+-    COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
++    COMMAND metal -fmodules-cache-path=${CMAKE_BINARY_DIR}/metal-cache ${METAL_FLAGS} -c ${SRCFILE}
+             -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
+     OUTPUT ${TARGET}.air
+@@ -204,7 +204,7 @@ endif()
+ 
+ add_custom_command(
+   OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+-  COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
++  COMMAND metallib ${KERNEL_AIR} -o
+           ${MLX_METAL_PATH}/mlx.metallib
+   DEPENDS ${KERNEL_AIR}
+   COMMENT "Building mlx.metallib"
+diff --git a/mlx/backend/metal/make_compiled_preamble.sh b/mlx/backend/metal/make_compiled_preamble.sh
+index 1b1d9cf4..b4f8c0de 100644
+--- a/mlx/backend/metal/make_compiled_preamble.sh
++++ b/mlx/backend/metal/make_compiled_preamble.sh
+@@ -31,7 +31,7 @@ OUTPUT_FILE=${OUTPUT_DIR}/${SRC_NAME}.cpp
+ mkdir -p "$OUTPUT_DIR"
+ 
+ # Use the metal compiler to get a list of headers (with depth)
+-CCC="xcrun -sdk macosx metal -x metal"
++CCC="metal -x metal -fmodules-cache-path=${OUTPUT_DIR}/metal-cache"
+ HDRS=$( $CCC -I"$SRC_DIR" -I"$JIT_INCLUDES" -DMLX_METAL_JIT -E -P -CC -C -H "$INPUT_FILE" $CFLAGS -w 2>&1 1>/dev/null )
+ 
+ # Fail early if the Metal compiler returned errors instead of header paths.

@@ -1,0 +1,213 @@
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import cast
+
+import mlx.core as mx
+from mlx_lm.generate import GenerationBatch, PromptProcessingBatch, generation_stream
+
+_PRECOMPUTE_TOP_K = 20
+
+
+@dataclass
+class BatchTopKLogprobs:
+    uids: list[int] = field(default_factory=list)
+    indices: mx.array | None = None
+    values: mx.array | None = None
+    selected: mx.array | None = None
+    _uid_to_row: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._uid_to_row = {uid: i for i, uid in enumerate(self.uids)}
+
+    def for_uid(self, uid: int) -> tuple[list[int], list[float], float] | None:
+        if self.indices is None or self.values is None or self.selected is None:
+            return None
+        row = self._uid_to_row.get(uid)
+        if row is None:
+            return None
+        return (
+            cast(list[int], self.indices[row].tolist()),
+            cast(list[float], self.values[row].tolist()),
+            float(self.selected[row].item()),
+        )
+
+
+@dataclass
+class _TopKBuffer:
+    needs_topk: bool = False
+    pending: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
+    ready: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
+
+
+def _get_buffer(batch: GenerationBatch) -> _TopKBuffer:
+    buf = getattr(batch, "_topk_buffer", None)
+    if buf is None:
+        buf = _TopKBuffer()
+        batch._topk_buffer = buf  # pyright: ignore[reportAttributeAccessIssue]
+    return buf
+
+
+def set_needs_topk(batch: GenerationBatch, needed: bool) -> None:
+    _get_buffer(batch).needs_topk = needed
+
+
+def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
+    return _get_buffer(batch).ready
+
+
+def _lazy_cache_metadata(cache: list[object]) -> list[mx.array]:
+    """The per-sequence bookkeeping arrays a cache updates lazily at every step: an
+    ArraysCache's left padding and lengths, which a linear attention layer moves on by the
+    number of tokens it processed, and a batch KV cache's offsets.
+
+    Not all of them are read during decode: a model builds its linear attention mask from
+    one layer's cache, and MiniMax M3 positions the keys of its sparse-attention index cache
+    with the attention cache's offsets, never reading the index cache's own. Unless they are
+    evaluated, each update chains onto the last and keeps every earlier one alive, each
+    holding a small Metal buffer, until the runner reaches Metal's resource limit and
+    crashes: within an hour of steady generation with Qwen3.5's linear attention layers,
+    and for MiniMax M3 (one buffer per layer per step) after about 8,000 decode steps of a
+    batch that never empties."""
+    arrays: list[mx.array] = []
+    for entry in cache:
+        sub_caches = cast(list[object] | None, getattr(entry, "caches", None))
+        if sub_caches is not None:
+            arrays.extend(_lazy_cache_metadata(sub_caches))
+            continue
+        for name in ("left_padding", "lengths", "offset"):
+            value = cast(object, getattr(entry, name, None))
+            if isinstance(value, mx.array):
+                arrays.append(value)
+    return arrays
+
+
+def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
+    self._current_tokens = self._next_tokens
+    self._current_logprobs = self._next_logprobs
+    inputs = self._current_tokens
+    assert inputs is not None, "_step requires initialized _next_tokens"
+
+    buf = _get_buffer(self)
+    buf.ready = buf.pending
+    buf.pending = BatchTopKLogprobs()
+
+    logits = self.model(inputs[:, None], cache=self.prompt_cache)
+    logits = logits[:, -1, :]
+
+    if any(self.logits_processors):
+        processed_logits: list[mx.array] = []
+        for e in range(len(self.uids)):
+            sample_logits = logits[e : e + 1]
+            for processor in self.logits_processors[e]:
+                sample_logits = processor(mx.array(self.tokens[e]), sample_logits)
+            processed_logits.append(sample_logits)
+        logits = mx.concatenate(processed_logits, axis=0)
+
+    # Normalise in float32. In bfloat16 the log-probs of the likeliest tokens are
+    # rounded to steps of up to 0.125 and close candidates tie, which changes what
+    # greedy and top-k sampling pick and what the API reports as log-probs.
+    logits = logits.astype(mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    if any(self.samplers):
+        all_samples: list[mx.array] = []
+        for e in range(len(self.uids)):
+            all_samples.append(self.samplers[e](logprobs[e : e + 1]))
+        sampled = mx.concatenate(all_samples, axis=0)
+    else:
+        sampled = self.fallback_sampler(logprobs)
+
+    self._next_tokens = sampled
+    self._next_logprobs = logprobs
+
+    if buf.needs_topk:
+        batch_size = len(self.uids)
+        k = min(_PRECOMPUTE_TOP_K, logprobs.shape[1])
+        pending_indices = mx.argpartition(-logprobs, k, axis=1)[:, :k]
+        pending_values = mx.take_along_axis(logprobs, pending_indices, axis=1)
+        sort_order = mx.argsort(-pending_values, axis=1)
+        pending_indices = mx.take_along_axis(pending_indices, sort_order, axis=1)
+        pending_values = mx.take_along_axis(pending_values, sort_order, axis=1)
+        pending_selected = logprobs[mx.arange(batch_size), sampled]
+        buf.pending = BatchTopKLogprobs(
+            uids=list(self.uids),
+            indices=pending_indices,
+            values=pending_values,
+            selected=pending_selected,
+        )
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            pending_indices,
+            pending_values,
+            pending_selected,
+            *_lazy_cache_metadata(self.prompt_cache),
+        )
+    else:
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            *_lazy_cache_metadata(self.prompt_cache),
+        )
+
+    current_lp = self._current_logprobs
+    if isinstance(current_lp, mx.array):
+        mx.eval(inputs, current_lp)
+    elif current_lp:
+        mx.eval(inputs, *current_lp)
+    else:
+        mx.eval(inputs)
+
+    token_list = cast(list[int], inputs.tolist())
+    for sti, ti in zip(self.tokens, token_list, strict=True):
+        sti.append(ti)
+
+    if isinstance(current_lp, mx.array):
+        current_lp = list(current_lp)
+    return token_list, current_lp
+
+
+_original_extend = cast(
+    Callable[[GenerationBatch, GenerationBatch], None],
+    GenerationBatch.extend,
+)
+
+
+def _logprob_rows(logprobs: mx.array | list[mx.array]) -> list[mx.array]:
+    return list(logprobs) if isinstance(logprobs, mx.array) else logprobs
+
+
+def _extend_with_array_logprobs(self: GenerationBatch, batch: GenerationBatch) -> None:
+    """The patched step keeps a step's log-probs as one [batch, vocab] array, where
+    mlx-lm keeps a list of rows, so that it can take the top-k of every row at once.
+    mlx-lm's extend appends to those lists: give it lists."""
+    for generation_batch in (self, batch):
+        generation_batch._current_logprobs = _logprob_rows(
+            generation_batch._current_logprobs
+        )
+        generation_batch._next_logprobs = _logprob_rows(generation_batch._next_logprobs)
+    _original_extend(self, batch)
+
+
+_original_prompt = cast(
+    Callable[[PromptProcessingBatch, list[list[int]]], None],
+    PromptProcessingBatch.prompt,
+)
+
+
+def _prompt_after_decode_step(
+    self: PromptProcessingBatch, tokens: list[list[int]]
+) -> None:
+    """BatchGenerator._next async-evaluates the batch's next decode step and then processes new
+    prompts. Wait for that step first. With MLX_METAL_FAST_SYNCH, a tensor-parallel prompt eval
+    started while the step's collectives are still running can deadlock: its GPU work spins
+    waiting for the communication stream, which is still waiting for the step's GPU work."""
+    if tokens:
+        mx.synchronize(generation_stream)
+    _original_prompt(self, tokens)
+
+
+def apply_batch_gen_patch() -> None:
+    GenerationBatch._step = _patched_step
+    GenerationBatch.extend = _extend_with_array_logprobs
+    PromptProcessingBatch.prompt = _prompt_after_decode_step

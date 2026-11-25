@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>SUFeedURL</key>
+	<string>https://assets.exolabs.net/appcast.xml</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>3600</integer>
+	<key>EXOBuildTag</key>
+	<string>$(EXO_BUILD_TAG)</string>
+	<key>EXOBuildCommit</key>
+	<string>$(EXO_BUILD_COMMIT)</string>
+	<key>EXOBugReportPresignedUrlEndpoint</key>
+	<string>https://reports.exolabs.net/presigned-urls</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>EXO finds and connects to your other Macs running EXO, so they can share memory and run larger models together.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_p2p._tcp</string>
+		<string>_p2p._udp</string>
+		<string>_libp2p._udp</string>
+	</array>
+</dict>
+</plist>

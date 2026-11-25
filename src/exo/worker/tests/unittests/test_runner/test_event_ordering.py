@@ -1,0 +1,373 @@
+# Check tasks are complete before runner is ever ready.
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Callable
+
+import pytest
+
+import exo.worker.engines.mlx.builder as mlx_builder
+import exo.worker.runner.llm_inference.batch_generator as mlx_batch_generator
+import exo.worker.runner.llm_inference.model_output_parsers as mlx_model_output_parsers
+from exo.shared.types.chunks import TokenChunk
+from exo.shared.types.events import (
+    ChunkGenerated,
+    Event,
+    RunnerEvent,
+    RunnerStatusUpdated,
+    TaskAcknowledged,
+    TaskStatusUpdated,
+)
+from exo.shared.types.tasks import (
+    ConnectToGroup,
+    LoadModel,
+    Shutdown,
+    StartWarmup,
+    Task,
+    TaskId,
+    TaskStatus,
+    TextGeneration,
+)
+from exo.shared.types.text_generation import (
+    InputMessage,
+    InputMessageContent,
+    TextGenerationTaskParams,
+)
+from exo.shared.types.worker.runner_response import GenerationResponse
+from exo.shared.types.worker.runners import (
+    RunnerConnected,
+    RunnerConnecting,
+    RunnerIdle,
+    RunnerLoaded,
+    RunnerLoading,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShutdown,
+    RunnerShuttingDown,
+    RunnerWarmingUp,
+)
+from exo.utils.channels import mp_channel
+from exo.worker.engines.mlx.builder import MlxBuilder
+from exo.worker.runner.runner import Runner
+
+from ...constants import (
+    CHAT_COMPLETION_TASK_ID,
+    COMMAND_1_ID,
+    INITIALIZATION_TASK_ID,
+    INSTANCE_1_ID,
+    LOAD_TASK_ID,
+    MODEL_A_ID,
+    NODE_A,
+    RUNNER_1_ID,
+    SHUTDOWN_TASK_ID,
+    WARMUP_TASK_ID,
+)
+from ..conftest import get_bound_mlx_ring_instance
+
+
+def make_nothin[T, U, V](res: T) -> Callable[[], T]:
+    def nothin(*_1: U, **_2: V) -> T:
+        return res
+
+    return nothin
+
+
+nothin = make_nothin(None)
+
+
+INIT_TASK = ConnectToGroup(
+    task_id=INITIALIZATION_TASK_ID,
+    instance_id=INSTANCE_1_ID,
+)
+
+LOAD_TASK = LoadModel(
+    task_id=LOAD_TASK_ID,
+    instance_id=INSTANCE_1_ID,
+)
+
+WARMUP_TASK = StartWarmup(
+    task_id=WARMUP_TASK_ID,
+    instance_id=INSTANCE_1_ID,
+)
+
+SHUTDOWN_TASK = Shutdown(
+    task_id=SHUTDOWN_TASK_ID,
+    instance_id=INSTANCE_1_ID,
+    runner_id=RUNNER_1_ID,
+)
+
+CHAT_PARAMS = TextGenerationTaskParams(
+    model=MODEL_A_ID,
+    input=[InputMessage(role="user", content=InputMessageContent("hello"))],
+    stream=True,
+    max_output_tokens=4,
+    temperature=0.0,
+)
+
+CHAT_TASK = TextGeneration(
+    task_id=CHAT_COMPLETION_TASK_ID,
+    command_id=COMMAND_1_ID,
+    task_params=CHAT_PARAMS,
+    instance_id=INSTANCE_1_ID,
+)
+
+
+def assert_events_equal(
+    test_events: Iterable[RunnerEvent], true_events: Iterable[RunnerEvent]
+):
+    for test_event, true_event in zip(test_events, true_events, strict=True):
+        test_event = test_event.model_copy(update={"event_id": true_event.event_id})
+        assert test_event == true_event, f"{test_event} != {true_event}"
+
+
+@dataclass
+class MockLoadOutput:
+    layers_loaded: int
+    total: int
+
+
+@pytest.fixture
+def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
+    # initialize_mlx returns a mock group
+    monkeypatch.setattr(mlx_builder, "initialize_mlx", make_nothin(MockGroup()))
+
+    def lmi_gen():
+        yield MockLoadOutput(1, 1)
+        return (1, MockTokenizer, None)
+
+    monkeypatch.setattr(mlx_builder, "load_mlx_items", make_nothin(lmi_gen()))
+    monkeypatch.setattr(mlx_batch_generator, "warmup_inference", make_nothin(1))
+    monkeypatch.setattr(mlx_batch_generator, "_check_for_debug_prompts", nothin)
+    monkeypatch.setattr(mlx_batch_generator, "mx_any", make_nothin(False))
+
+    def fake_all_gather(
+        tasks: list[TextGeneration], group: object
+    ) -> tuple[list[TextGeneration], list[TextGeneration]]:
+        return (tasks, [])
+
+    monkeypatch.setattr(mlx_batch_generator, "mx_all_gather_tasks", fake_all_gather)
+    # Mock apply_chat_template since we're using a fake tokenizer (integer 1).
+    # Returns a prompt without thinking tag so detect_thinking_prompt_suffix returns None.
+    monkeypatch.setattr(
+        mlx_batch_generator, "apply_chat_template", make_nothin("test prompt")
+    )
+    monkeypatch.setattr(
+        mlx_model_output_parsers, "detect_thinking_prompt_suffix", make_nothin(False)
+    )
+    monkeypatch.setattr(mlx_batch_generator, "ExoBatchGenerator", FakeExoBatchGenerator)
+
+    def _no_prefill_server(_self: Runner) -> int | None:
+        return None
+
+    monkeypatch.setattr(Runner, "_start_prefill_server", _no_prefill_server)
+
+
+class FakeExoBatchGenerator:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self._uid_counter = 0
+        self._pending: dict[int, GenerationResponse] = {}
+
+    @property
+    def has_work(self) -> bool:
+        return bool(self._pending)
+
+    def submit(
+        self,
+        task_params: object = None,
+        prompt: object = None,
+        on_prefill_progress: object = None,
+        distributed_prompt_progress_callback: object = None,
+        on_generation_token: object = None,
+    ) -> int:
+        uid = self._uid_counter
+        self._uid_counter += 1
+        self._pending[uid] = GenerationResponse(
+            text="hi",
+            token=0,
+            finish_reason="stop",
+            usage=None,
+        )
+        return uid
+
+    def step(self) -> list[tuple[int, GenerationResponse]]:
+        results = list(self._pending.items())
+        self._pending.clear()
+        return results
+
+    def cancel(self, uids: list[int]) -> None:
+        for uid in uids:
+            self._pending.pop(uid, None)
+
+    def close(self) -> None:
+        pass
+
+
+# Use a fake event_sender to remove test flakiness.
+class EventCollector:
+    def __init__(self, on_event: Callable[[Event], None] | None = None) -> None:
+        self.events: list[RunnerEvent] = []
+        self._on_event = on_event
+
+    def send(self, event: Event) -> None:
+        self.events.append(event)
+        if self._on_event:
+            self._on_event(event)
+
+    def close(self) -> None:
+        pass
+
+    def join(self) -> None:
+        pass
+
+
+class MockTokenizer:
+    tool_parser = None
+    tool_call_start = None
+    tool_call_end = None
+    has_tool_calling = False
+    has_thinking = False
+    think_start = None
+    think_end = None
+    eos_token_ids: list[int] = []
+
+    @staticmethod
+    def decode(_tokens: list[int]) -> str:
+        return "hi"
+
+    @staticmethod
+    def encode(_text: str, add_special_tokens: bool = True) -> list[int]:
+        return [0]
+
+
+class MockGroup:
+    def rank(self) -> int:
+        return 0
+
+    def size(self) -> int:
+        return 1
+
+
+def _run(tasks: Iterable[Task], send_after_ready: list[Task] | None = None):
+    bound_instance = get_bound_mlx_ring_instance(
+        instance_id=INSTANCE_1_ID,
+        model_id=MODEL_A_ID,
+        runner_id=RUNNER_1_ID,
+        node_id=NODE_A,
+    )
+
+    task_sender, task_receiver = mp_channel[Task]()
+    _cancel_sender, cancel_receiver = mp_channel[TaskId]()
+
+    on_event: Callable[[Event], None] | None = None
+    if send_after_ready:
+        _saw_running = False
+
+        def _on_event(event: Event) -> None:
+            nonlocal _saw_running
+            if isinstance(event, RunnerStatusUpdated):
+                if isinstance(event.runner_status, RunnerRunning):
+                    _saw_running = True
+                elif _saw_running and isinstance(event.runner_status, RunnerReady):
+                    for t in send_after_ready:
+                        task_sender.send(t)
+
+        on_event = _on_event
+
+    event_sender = EventCollector(on_event=on_event)
+
+    with task_sender:
+        for t in tasks:
+            task_sender.send(t)
+
+        # worst monkeypatch known to man
+        # this is some c++ nonsense
+        task_receiver.close = nothin
+        task_receiver.join = nothin
+        builder = MlxBuilder(
+            bound_instance.bound_shard.model_card.model_id,
+            event_sender,  # pyright: ignore[reportArgumentType]
+            cancel_receiver,
+        )
+        runner = Runner(
+            bound_instance,
+            builder,
+            event_sender,  # pyright: ignore[reportArgumentType]
+            task_receiver,
+        )
+        runner.main()
+
+        return event_sender.events
+
+
+def test_events_processed_in_correct_order(patch_out_mlx: pytest.MonkeyPatch):
+    events = _run(
+        [INIT_TASK, LOAD_TASK, WARMUP_TASK, CHAT_TASK],
+        send_after_ready=[SHUTDOWN_TASK],
+    )
+
+    expected_chunk = ChunkGenerated(
+        command_id=COMMAND_1_ID,
+        chunk=TokenChunk(
+            model=MODEL_A_ID,
+            text="hi",
+            token_id=0,
+            finish_reason="stop",
+            usage=None,
+            stats=None,
+        ),
+    )
+
+    assert_events_equal(
+        events,
+        [
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerIdle()),
+            TaskStatusUpdated(
+                task_id=INITIALIZATION_TASK_ID, task_status=TaskStatus.Running
+            ),
+            RunnerStatusUpdated(
+                runner_id=RUNNER_1_ID, runner_status=RunnerConnecting()
+            ),
+            TaskAcknowledged(task_id=INITIALIZATION_TASK_ID),
+            TaskStatusUpdated(
+                task_id=INITIALIZATION_TASK_ID, task_status=TaskStatus.Complete
+            ),
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerConnected()),
+            TaskStatusUpdated(task_id=LOAD_TASK_ID, task_status=TaskStatus.Running),
+            RunnerStatusUpdated(
+                runner_id=RUNNER_1_ID,
+                runner_status=RunnerLoading(layers_loaded=0, total_layers=32),
+            ),
+            TaskAcknowledged(task_id=LOAD_TASK_ID),
+            RunnerStatusUpdated(
+                runner_id=RUNNER_1_ID,
+                runner_status=RunnerLoading(layers_loaded=1, total_layers=1),
+            ),
+            TaskStatusUpdated(task_id=LOAD_TASK_ID, task_status=TaskStatus.Complete),
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerLoaded()),
+            TaskStatusUpdated(task_id=WARMUP_TASK_ID, task_status=TaskStatus.Running),
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerWarmingUp()),
+            TaskAcknowledged(task_id=WARMUP_TASK_ID),
+            TaskStatusUpdated(task_id=WARMUP_TASK_ID, task_status=TaskStatus.Complete),
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerReady()),
+            TaskStatusUpdated(
+                task_id=CHAT_COMPLETION_TASK_ID, task_status=TaskStatus.Running
+            ),
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerRunning()),
+            TaskAcknowledged(task_id=CHAT_COMPLETION_TASK_ID),
+            expected_chunk,
+            TaskStatusUpdated(
+                task_id=CHAT_COMPLETION_TASK_ID, task_status=TaskStatus.Complete
+            ),
+            # CHAT COMPLETION TASK SHOULD COMPLETE BEFORE RUNNER READY
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerReady()),
+            TaskStatusUpdated(task_id=SHUTDOWN_TASK_ID, task_status=TaskStatus.Running),
+            RunnerStatusUpdated(
+                runner_id=RUNNER_1_ID, runner_status=RunnerShuttingDown()
+            ),
+            TaskAcknowledged(task_id=SHUTDOWN_TASK_ID),
+            TaskStatusUpdated(
+                task_id=SHUTDOWN_TASK_ID, task_status=TaskStatus.Complete
+            ),
+            # SPECIAL EXCEPTION FOR RUNNER SHUTDOWN
+            RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerShutdown()),
+        ],
+    )

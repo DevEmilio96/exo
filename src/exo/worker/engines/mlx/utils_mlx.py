@@ -1,0 +1,940 @@
+import json
+import os
+import re
+import tempfile
+import time
+from collections.abc import Generator, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from exo.worker.engines.mlx.vision import VisionProcessor
+
+# Monkey-patch for transformers 5.x compatibility
+# Kimi's tokenization_kimi.py imports bytes_to_unicode from the old location
+# which was moved in transformers 5.0.0rc2
+try:
+    import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    if not hasattr(gpt2_tokenization, "bytes_to_unicode"):
+        gpt2_tokenization.bytes_to_unicode = bytes_to_unicode  # type: ignore[attr-defined]
+except ImportError:
+    pass  # transformers < 5.0 or bytes_to_unicode not available
+
+from mlx_lm.models.cache import KVCache
+from mlx_lm.models.deepseek_v3 import DeepseekV3Model
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+from exo.shared.models.model_cards import ModelId
+from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
+from exo.worker.engines.mlx.models.registry import (
+    architecture_for_model,
+    get_model_classes,
+    prompt_encoder_for,
+    reasoning_effort_hook_for,
+    template_kwargs_for,
+    template_messages_hooks_for,
+    tokenizer_loader_for,
+)
+from exo.worker.engines.mlx.models.spec_registry import (
+    added_eos_tokens_for_model_id,
+    eos_token_ids_for_model_id,
+)
+
+try:
+    from mlx_lm.tokenizer_utils import load_tokenizer
+except ImportError:
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+import contextlib
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+from mlx_lm.generate import generation_stream
+from mlx_lm.utils import load_model
+from pydantic import RootModel
+
+from exo.download.download_utils import build_model_path
+from exo.shared.types.common import Host
+from exo.shared.types.memory import Memory
+from exo.shared.types.tasks import TaskId, TextGeneration
+from exo.shared.types.text_generation import ChatTemplateValue, TextGenerationTaskParams
+from exo.shared.types.worker.instances import (
+    BoundInstance,
+    MlxJacclInstance,
+    MlxRingInstance,
+)
+from exo.shared.types.worker.runner_response import ModelLoadingResponse
+from exo.shared.types.worker.shards import (
+    CfgShardMetadata,
+    PipelineShardMetadata,
+    ShardMetadata,
+    TensorShardMetadata,
+)
+from exo.worker.engines.mlx.auto_parallel import (
+    pipeline_auto_parallel,
+    tensor_auto_parallel,
+)
+from exo.worker.engines.mlx.sharding.pipeline import get_inner_model, get_layers
+from exo.worker.engines.mlx.types import Model
+from exo.worker.runner.bootstrap import logger
+
+
+def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
+    return Memory.from_float_kb(
+        (model_shard_meta.end_layer - model_shard_meta.start_layer)
+        / model_shard_meta.n_layers
+        * model_shard_meta.model_card.resident_size.in_kb
+        / (
+            1
+            if isinstance(model_shard_meta, PipelineShardMetadata)
+            else model_shard_meta.world_size
+        )
+    )
+
+
+class HostList(RootModel[list[str]]):
+    @classmethod
+    def from_hosts(cls, hosts: list[Host]) -> "HostList":
+        return cls(root=[str(host) for host in hosts])
+
+
+def mlx_distributed_init(
+    bound_instance: BoundInstance,
+) -> mx.distributed.Group:
+    """
+    Initialize MLX distributed.
+    """
+    rank = bound_instance.bound_shard.device_rank
+    logger.info(f"Starting initialization for rank {rank}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        coordination_file = str(
+            Path(tmpdir) / f"hosts_{bound_instance.instance.instance_id}_{rank}.json"
+        )
+        # TODO: singleton instances
+        match bound_instance.instance:
+            case MlxRingInstance(hosts_by_node=hosts_by_node, ephemeral_port=_):
+                hosts_for_node = hosts_by_node[bound_instance.bound_node_id]
+                hosts_json = HostList.from_hosts(hosts_for_node).model_dump_json()
+
+                with open(coordination_file, "w") as f:
+                    _ = f.write(hosts_json)
+
+                logger.info(
+                    f"rank {rank} hostfile: {coordination_file} hosts: {hosts_json}"
+                )
+
+                os.environ["MLX_HOSTFILE"] = coordination_file
+                os.environ["MLX_RANK"] = str(rank)
+                # os.environ["MLX_RING_VERBOSE"] = "1"  # NOTE: we don't use it enough to care (turn on again if need to)
+
+                group = mx.distributed.init(backend="ring", strict=True)
+
+            case MlxJacclInstance(
+                jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
+            ):
+                assert all(
+                    jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
+                )
+                # Use RDMA connectivity matrix
+                jaccl_devices_json = json.dumps(jaccl_devices)
+
+                with open(coordination_file, "w") as f:
+                    _ = f.write(jaccl_devices_json)
+
+                jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
+
+                logger.info(
+                    f"rank {rank} MLX_IBV_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
+                )
+                logger.info(f"rank {rank} MLX_JACCL_COORDINATOR: {jaccl_coordinator}")
+                os.environ["MLX_IBV_DEVICES"] = coordination_file
+                os.environ["MLX_RANK"] = str(rank)
+                os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
+                group = mx.distributed.init(backend="jaccl", strict=True)
+
+        logger.info(f"Rank {rank} mlx distributed initialization complete")
+
+        return group
+
+
+class MissingWeightsError(ValueError):
+    """The checkpoint does not provide every parameter of the model class it loads as."""
+
+
+@contextlib.contextmanager
+def _record_loaded_weight_names(names: set[str]) -> Generator[None]:
+    """Record the parameter names mlx-lm's load_model hands to Module.load_weights."""
+    original = nn.Module.load_weights
+
+    def recording(
+        self: nn.Module,
+        file_or_weights: str | list[tuple[str, mx.array]],
+        strict: bool = True,
+    ) -> nn.Module:
+        if isinstance(file_or_weights, list):
+            names.update(name for name, _ in file_or_weights)
+        return original(self, file_or_weights, strict=strict)
+
+    nn.Module.load_weights = recording
+    try:
+        yield
+    finally:
+        nn.Module.load_weights = original
+
+
+def load_model_checked(model_path: Path) -> nn.Module:
+    """mlx-lm's load_model(lazy=True, strict=False), refusing checkpoints that leave
+    model parameters unset.
+
+    strict=False tolerates checkpoint tensors the model doesn't use (MTP layers, vision
+    towers), but it also silently keeps any parameter the checkpoint lacks at its random
+    initialisation. That is how GLM-5.2/5.3 ran with 57 randomly initialised DSA indexers
+    on an mlx-lm without cross-layer indexer sharing.
+    """
+    loaded_names: set[str] = set()
+    with _record_loaded_weight_names(loaded_names):
+        model, _ = load_model(
+            model_path, lazy=True, strict=False, get_model_classes=get_model_classes
+        )
+    parameter_names = {name for name, _ in tree_flatten(model.parameters())}
+    missing = sorted(parameter_names - loaded_names)
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise MissingWeightsError(
+            f"The checkpoint at {model_path} does not provide {len(missing)} of the "
+            f"model's parameters (e.g. {preview}); they would run randomly initialised. "
+            "The model's architecture is probably not supported."
+        )
+    return model
+
+
+def initialize_mlx(
+    bound_instance: BoundInstance,
+) -> mx.distributed.Group:
+    # should we unseed it?
+    # TODO: pass in seed from params
+    mx.random.seed(42)
+
+    assert len(bound_instance.instance.shard_assignments.node_to_runner) > 1, (
+        "Tried to initialize mlx for a single node instance"
+    )
+    return mlx_distributed_init(bound_instance)
+
+
+def load_mlx_items(
+    bound_instance: BoundInstance,
+    group: mx.distributed.Group | None,
+) -> Generator[
+    ModelLoadingResponse, None, tuple[Model, TokenizerWrapper, "VisionProcessor | None"]
+]:
+    set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
+
+    if group is None:
+        logger.info(f"Single device used for {bound_instance.instance}")
+        model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
+        start_time = time.perf_counter()
+        model = load_model_checked(model_path)
+        # Eval layers one by one for progress reporting
+        try:
+            inner = get_inner_model(model)
+            layers = get_layers(inner)
+            total = len(layers)
+            for i, layer in enumerate(layers):
+                mx.eval(layer)  # type: ignore
+                yield ModelLoadingResponse(layers_loaded=i, total=total)
+        except ValueError as e:
+            logger.opt(exception=e).debug(
+                "Model architecture doesn't support layer-by-layer progress tracking",
+            )
+        mx.eval(model)
+        run_post_load(model, model_path)
+        end_time = time.perf_counter()
+        logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
+        tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
+
+    else:
+        logger.info("Starting distributed init")
+        start_time = time.perf_counter()
+        model, tokenizer = yield from shard_and_load(
+            bound_instance.bound_shard,
+            group=group,
+        )
+        end_time = time.perf_counter()
+        logger.info(
+            f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
+        )
+
+    mx.clear_cache()
+
+    vision_config = bound_instance.bound_shard.model_card.vision
+
+    if vision_config is not None:
+        from exo.worker.engines.mlx.vision import VisionProcessor
+
+        vision_start_time = time.perf_counter()
+        try:
+            vision_processor: VisionProcessor | None = VisionProcessor(
+                vision_config, bound_instance.bound_shard.model_card.model_id
+            )
+            vision_processor.load()
+            logger.info(
+                f"Time taken to load vision weights: {(time.perf_counter() - vision_start_time):.2f}s"
+            )
+        except Exception as e:
+            logger.opt(exception=e).error(
+                "Failed to load vision weights — disabling vision for this runner"
+            )
+            vision_processor = None
+    else:
+        vision_processor = None
+
+    return cast(Model, model), tokenizer, vision_processor
+
+
+def run_post_load(model: nn.Module, model_path: Path) -> None:
+    """Run the model family's post-load step, if it has one."""
+    architecture = architecture_for_model(model)
+    if architecture is not None and architecture.post_load is not None:
+        architecture.post_load(model, model_path)
+
+
+def shard_and_load(
+    shard_metadata: ShardMetadata,
+    group: mx.distributed.Group,
+) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
+    model_path = build_model_path(shard_metadata.model_card.model_id)
+
+    model = load_model_checked(model_path)
+    logger.debug(model)
+    if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
+        pass
+        # TODO: See if we should quantize the model.
+        # def is_attention_layer(path: str) -> bool:
+        #     path = path.lower()
+
+        #     return "self_attn" in path and "layernorm" not in path
+
+        # def quant_predicate(path: str, module: nn.Module):
+        #     if not isinstance(module, nn.Linear):
+        #         return False
+
+        #     return is_attention_layer(path)
+        # model, config = quantize_model(
+        #        model, config, group_size=KV_GROUP_SIZE, bits=ATTENTION_KV_BITS, quant_predicate=quant_predicate, mode=QUANTIZE_MODEL_MODE
+        #    )
+
+    assert isinstance(model, nn.Module)
+
+    tokenizer = get_tokenizer(model_path, shard_metadata)
+
+    logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
+
+    match shard_metadata:
+        case TensorShardMetadata():
+            logger.info(f"loading model from {model_path} with tensor parallelism")
+            model = yield from tensor_auto_parallel(model, group)
+        case PipelineShardMetadata():
+            logger.info(f"loading model from {model_path} with pipeline parallelism")
+            model = yield from pipeline_auto_parallel(model, group, shard_metadata)
+            mx.eval(model.parameters())
+        case CfgShardMetadata():
+            raise ValueError(
+                "CfgShardMetadata is not supported for text model loading - "
+                "this metadata type is only for image generation models"
+            )
+
+    # TODO: Do we need this?
+    mx.eval(model)
+    run_post_load(model, model_path)
+
+    logger.debug("SHARDED")
+    logger.debug(model)
+
+    # Synchronize processes before generation to avoid timeout
+    mx_barrier(group)
+
+    return model, tokenizer
+
+
+def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata) -> TokenizerWrapper:
+    """Load tokenizer for a model shard. Delegates to load_tokenizer_for_model_id."""
+    return load_tokenizer_for_model_id(
+        shard_metadata.model_card.model_id,
+        model_path,
+        trust_remote_code=shard_metadata.model_card.trust_remote_code,
+    )
+
+
+def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
+    """
+    Get the EOS token IDs for a model based on its ID.
+
+    Some models require explicit EOS token configuration that isn't in their
+    tokenizer config. This function returns the known EOS token IDs for such models.
+
+    Args:
+        model_id: The HuggingFace model ID
+
+    Returns:
+        List of EOS token IDs, or None if the model uses standard tokenizer config
+    """
+    return eos_token_ids_for_model_id(model_id)
+
+
+def load_tokenizer_for_model_id(
+    model_id: ModelId, model_path: Path, *, trust_remote_code: bool = TRUST_REMOTE_CODE
+) -> TokenizerWrapper:
+    """
+    Load tokenizer for a model given its ID and local path.
+
+    This is the core tokenizer loading logic, handling special cases for different
+    model families (Kimi, GLM, etc.) and transformers 5.x compatibility.
+
+    Args:
+        model_id: The HuggingFace model ID (e.g., "moonshotai/Kimi-K2-Instruct")
+        model_path: Local path where the model/tokenizer files are stored
+
+    Returns:
+        TokenizerWrapper instance configured for the model
+    """
+    eos_token_ids = get_eos_token_ids_for_model(model_id)
+
+    # e.g. Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
+    tokenizer_loader = tokenizer_loader_for(model_id)
+    if tokenizer_loader is not None:
+        tokenizer = tokenizer_loader.load(model_path, eos_token_ids)
+    else:
+        # We should really consider going back to mlx lm load to get tokenizer
+        tokenizer = load_tokenizer(
+            model_path,
+            tokenizer_config_extra={"trust_remote_code": trust_remote_code},
+            eos_token_ids=eos_token_ids,
+        )
+    add_eos_tokens(tokenizer, added_eos_tokens_for_model_id(model_id))
+
+    return tokenizer
+
+
+class _AddedToken(Protocol):
+    content: str
+    special: bool
+
+
+def add_eos_tokens(
+    tokenizer: TokenizerWrapper, tokens: tuple[tuple[int, str], ...]
+) -> None:
+    """Adds each (token id, token) to the tokenizer's EOS tokens where the tokenizer has
+    that special token at that id."""
+    if not tokens:
+        return
+    added_tokens = cast(Mapping[int, _AddedToken], tokenizer.added_tokens_decoder)
+    for token_id, content in tokens:
+        token = added_tokens.get(token_id)
+        if token is not None and token.special and token.content == content:
+            tokenizer.add_eos_token(str(token_id))
+
+
+def _normalize_tool_calls(msg_dict: dict[str, Any]) -> None:
+    """Normalize tool_calls in a message dict.
+
+    OpenAI format has tool_calls[].function.arguments as a JSON string,
+    but some chat templates (e.g., GLM) expect it as a dict.
+    """
+    tool_calls = msg_dict.get("tool_calls")
+    if not tool_calls or not isinstance(tool_calls, list):
+        return
+
+    for tc in tool_calls:  # pyright: ignore[reportUnknownVariableType]
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if not isinstance(func, dict):
+            continue
+        args = func.get("arguments")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if isinstance(args, str):
+            with contextlib.suppress(json.JSONDecodeError):
+                func["arguments"] = json.loads(args)
+
+
+def _collect_nested_property_names(schema: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    properties: dict[str, Any] = schema.get("properties", {})  # type: ignore[reportAny]
+    for prop_spec in properties.values():  # pyright: ignore[reportAny]
+        if not isinstance(prop_spec, dict):
+            continue
+        if prop_spec.get("type") == "array":  # type: ignore[reportAny]
+            items: dict[str, Any] | None = prop_spec.get("items")  # type: ignore[reportAny]
+            if isinstance(items, dict) and items.get("type") == "object":  # type: ignore[reportAny]
+                inner_props: dict[str, Any] = items.get("properties", {})  # type: ignore[reportAny]
+                for k in inner_props:  # pyright: ignore[reportUnknownVariableType]
+                    names.add(str(k))  # pyright: ignore[reportUnknownArgumentType]
+                names.update(_collect_nested_property_names(items))  # pyright: ignore[reportUnknownArgumentType]
+    return names
+
+
+def _schemas_lost_in_prompt(prompt: str, tools: list[dict[str, Any]]) -> bool:
+    """Return True if nested property names from any tool schema are absent."""
+    for tool in tools:
+        fn: dict[str, Any] = tool.get("function", {})  # type: ignore
+        params: dict[str, Any] = fn.get("parameters", {})  # type: ignore
+        nested = _collect_nested_property_names(params)
+        if nested and not all(name in prompt for name in nested):
+            return True
+    return False
+
+
+_LOSSY_TEMPLATE_PATTERN = re.compile(
+    r"""inner_type\s*==\s*["']object \| object["']\s*or\s*inner_type\|length\s*>\s*\d+""",
+)
+
+
+def _patch_lossy_chat_template(template: str) -> str | None:
+    """Patch chat templates that collapse nested object schemas to ``any[]``.
+
+    Some templates (e.g., GPT-OSS) have a guard like::
+
+        inner_type == "object | object" or inner_type|length > 50
+
+    The length check silently drops complex array-of-object schemas.
+    We remove the length guard, keeping only the object-union check.
+    Returns the patched template, or *None* if no patch was needed.
+    """
+    patched, n = _LOSSY_TEMPLATE_PATTERN.subn(
+        lambda m: m.group(0).split(" or ")[0],  # keep only the object-union check
+        template,
+    )
+    return patched if n > 0 else None
+
+
+def consolidate_system_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    System messages almost exclusively must go at the start of a message
+    and there must only be a single one.
+
+    Also, Codex sends "developer" messages which are just system prompts.
+    """
+    system_parts: list[str] = []
+    non_system: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") in ("system", "developer"):
+            content = cast(str, msg.get("content", ""))
+            if content:
+                system_parts.append(content)
+        else:
+            non_system.append(msg)
+    formatted_messages = non_system
+    if system_parts:
+        formatted_messages.insert(
+            0, {"role": "system", "content": "\n".join(system_parts)}
+        )
+    return formatted_messages
+
+
+class _ChatTemplateRenderer(Protocol):
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        add_generation_prompt: bool,
+        tokenize: bool,
+        return_dict: bool,
+        **kwargs: bool | str,
+    ) -> str: ...
+
+
+def _render_leaving_thinking_unset(
+    tokenizer: TokenizerWrapper,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    template_kwargs: dict[str, bool | str],
+) -> str:
+    """Render a request that does not say whether to think.
+
+    mlx-lm's TokenizerWrapper then sets the template's own thinking switch to whether
+    the tokenizer has thinking tokens. A template whose switch is `thinking` (DeepSeek
+    V3.1) defaults to not thinking, so that turns thinking on. exo only ever defaulted
+    `enable_thinking`, so call the Hugging Face tokenizer as the wrapper would, with
+    that default alone, and let such a template keep its own default.
+    """
+    if cast(object, getattr(tokenizer, "_chat_template", None)) is not None:
+        # The wrapper renders with a template function of its own
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=tools,
+            **template_kwargs,
+        )
+    renderer = cast(_ChatTemplateRenderer, cast(object, tokenizer._tokenizer))
+    return renderer.apply_chat_template(
+        messages,
+        tools=tools,
+        add_generation_prompt=True,
+        tokenize=False,
+        return_dict=False,
+        **{"enable_thinking": tokenizer.has_thinking, **template_kwargs},
+    )
+
+
+def render_chat_template(
+    tokenizer: TokenizerWrapper,
+    messages: list[dict[str, Any]],
+    task_params: TextGenerationTaskParams,
+    model_type: str | None = None,
+) -> str:
+    """
+    Convert TextGenerationTaskParams to a chat template prompt.
+
+    Converts the internal format (input + instructions) to a messages list
+    that can be processed by the tokenizer's chat template.
+
+    When chat_template_messages is available (from Chat Completions API),
+    uses those directly to preserve tool_calls, thinking, and other fields.
+    """
+    formatted_messages = consolidate_system_messages(messages)
+
+    # For assistant prefilling, append content after templating to avoid a closing turn token.
+    partial_assistant_content: str | None = None
+    if formatted_messages and formatted_messages[-1].get("role") == "assistant":
+        partial_assistant_content = cast(str, formatted_messages[-1].get("content", ""))
+        formatted_messages = formatted_messages[:-1]
+
+    prompt_encoder = prompt_encoder_for(task_params, model_type)
+    if prompt_encoder is not None:
+        prompt = prompt_encoder.encode(formatted_messages, task_params)
+        if partial_assistant_content:
+            prompt += partial_assistant_content
+        return prompt
+
+    for msg in formatted_messages:
+        _normalize_tool_calls(msg)
+
+    template_hooks = template_messages_hooks_for(task_params)
+    for hook in template_hooks:
+        hook.prepare(formatted_messages)
+
+    extra_kwargs: dict[str, Any] = {}
+    if task_params.enable_thinking is not None:
+        # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
+        # Jinja ignores unknown variables, so passing both is safe.
+        extra_kwargs["enable_thinking"] = task_params.enable_thinking
+        extra_kwargs["thinking"] = task_params.enable_thinking
+    effort_hook = reasoning_effort_hook_for(task_params)
+    if effort_hook is not None:
+        template_effort = effort_hook.template_effort(task_params)
+        if template_effort is not None:
+            extra_kwargs["reasoning_effort"] = template_effort
+    elif task_params.reasoning_effort is not None:
+        extra_kwargs["reasoning_effort"] = task_params.reasoning_effort
+    extra_kwargs.update(template_kwargs_for(task_params))
+
+    patched_template: str | None = None
+    if task_params.tools:
+        original_template: str | None = getattr(tokenizer, "chat_template", None)
+        if isinstance(original_template, str):
+            patched_template = _patch_lossy_chat_template(original_template)
+            if patched_template is not None:
+                logger.info(
+                    "Patched lossy chat template (removed inner_type length guard)"
+                )
+
+    template_kwargs: dict[str, bool | str] = {
+        **({"chat_template": patched_template} if patched_template is not None else {}),
+        **extra_kwargs,
+    }
+    if task_params.enable_thinking is None:
+        prompt = _render_leaving_thinking_unset(
+            tokenizer, formatted_messages, task_params.tools, template_kwargs
+        )
+    else:
+        prompt = tokenizer.apply_chat_template(
+            formatted_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=task_params.tools,
+            **template_kwargs,
+        )
+
+    if task_params.tools and _schemas_lost_in_prompt(prompt, task_params.tools):
+        logger.warning("Chat template lost nested tool schemas even after patching")
+
+    if effort_hook is not None and task_params.enable_thinking is False:
+        suffix = effort_hook.thinking_off_suffix(task_params)
+        if suffix is not None:
+            prompt += suffix
+
+    if partial_assistant_content:
+        prompt += "".join(hook.prefill_prefix for hook in template_hooks)
+        prompt += partial_assistant_content
+
+    return prompt
+
+
+def apply_chat_template(
+    tokenizer: TokenizerWrapper,
+    task_params: TextGenerationTaskParams,
+    model_type: str | None = None,
+) -> str:
+    messages: list[dict[str, ChatTemplateValue]] = []
+    if task_params.chat_template_messages is not None:
+        # Use pre-formatted messages that preserve tool_calls, thinking, etc.
+        messages = task_params.chat_template_messages
+    else:
+        # Add system message (instructions) if present
+        if task_params.instructions:
+            messages.append({"role": "system", "content": task_params.instructions})
+
+        # Convert input to messages
+        for msg in task_params.input:
+            if not msg.content:
+                logger.warning("Received message with empty content, skipping")
+                continue
+            messages.append({"role": msg.role, "content": msg.content})
+
+    prompt = render_chat_template(tokenizer, messages, task_params, model_type)
+    logger.debug(prompt)
+
+    return prompt
+
+
+def system_prompt_token_count(
+    task_params: TextGenerationTaskParams,
+    tokenizer: TokenizerWrapper,
+) -> int:
+    """Approximate token count of the system prompt portion of the input."""
+    parts: list[str] = []
+    if task_params.chat_template_messages is not None:
+        for msg in task_params.chat_template_messages:
+            if msg.get("role") in ("system", "developer"):
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+    else:
+        if task_params.instructions:
+            parts.append(task_params.instructions)
+        for msg in task_params.input:
+            if msg.role in ("system", "developer"):
+                parts.append(msg.content)
+    if len(parts) == 0:
+        return 0
+    return len(tokenizer.encode(" ".join(parts), add_special_tokens=False))
+
+
+def detect_thinking_prompt_suffix(prompt: str, tokenizer: TokenizerWrapper) -> bool:
+    """
+    Detect if prompt ends with a thinking opening tag that should be
+    prepended to the output stream.
+    """
+    think_token = tokenizer.think_start
+
+    return think_token is not None and prompt.rstrip().endswith(think_token)
+
+
+def fix_unmatched_think_end_tokens(
+    tokens: mx.array, tokenizer: TokenizerWrapper
+) -> mx.array:
+    if not tokenizer.has_thinking:
+        return tokens
+    assert tokenizer.think_start_tokens
+    assert tokenizer.think_end_tokens
+    think_start_tokens: list[int] = tokenizer.think_start_tokens
+    think_end_tokens: list[int] = tokenizer.think_end_tokens
+    token_list: list[int] = cast(list[int], tokens.tolist())
+    result: list[int] = []
+
+    depth = 0
+    accumulated_think_start_length = 0
+    accumulated_think_end_length = 0
+
+    for token in token_list:
+        if token == think_start_tokens[accumulated_think_start_length]:
+            accumulated_think_start_length += 1
+            if accumulated_think_start_length == len(think_start_tokens):
+                depth += 1
+                accumulated_think_start_length = 0
+
+        elif token == think_end_tokens[accumulated_think_end_length]:
+            accumulated_think_end_length += 1
+            if accumulated_think_end_length == len(think_end_tokens):
+                if depth == 0:
+                    result.extend(think_start_tokens)
+                else:
+                    depth -= 1
+                accumulated_think_end_length = 0
+
+        else:
+            accumulated_think_start_length = 0
+            accumulated_think_end_length = 0
+
+        result.append(token)
+    return mx.array(result)
+
+
+class NullKVCache(KVCache):
+    """
+    A KVCache that pretends to exist but holds zero tokens.
+    It satisfies .state/.meta_state and never allocates real keys/values.
+    """
+
+    def __init__(self, dtype: mx.Dtype = mx.float16):
+        super().__init__()
+        # zero-length K/V so shapes/dtypes are defined but empty
+        self.keys = mx.zeros((1, 1, 0, 1), dtype=dtype)
+        self.values = mx.zeros((1, 1, 0, 1), dtype=dtype)
+        self.offset = 0
+
+    @property
+    def state(self) -> tuple[mx.array, mx.array]:
+        # matches what mx.save_safetensors / mx.eval expect
+        assert self.keys is not None and self.values is not None
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v: tuple[mx.array, mx.array]) -> None:
+        raise NotImplementedError("We should not be setting a NullKVCache.")
+
+
+def mlx_force_oom(size: int = 200000) -> None:
+    """
+    Force an Out-Of-Memory (OOM) error in MLX by performing large tensor operations.
+    """
+    mx.set_default_device(mx.gpu)
+    a = mx.random.uniform(shape=(size, size), dtype=mx.float32)
+    b = mx.random.uniform(shape=(size, size), dtype=mx.float32)
+    mx.eval(a, b)
+    c = mx.matmul(a, b)
+    d = mx.matmul(a, c)
+    e = mx.matmul(b, c)
+    f = mx.sigmoid(d + e)
+    mx.eval(f)
+
+
+def set_wired_limit_for_model(model_size: Memory):
+    """
+    A context manager to temporarily change the wired limit.
+
+    Note, the wired limit should not be changed during an async eval.  If an
+    async eval could be running pass in the streams to synchronize with prior
+    to exiting the context manager.
+    """
+    if not mx.metal.is_available():
+        return
+
+    max_rec_size = Memory.from_bytes(
+        int(mx.device_info()["max_recommended_working_set_size"])
+    )
+    if model_size > 0.9 * max_rec_size:
+        logger.warning(
+            f"Generating with a model that requires {model_size.in_float_mb:.1f} MB "
+            f"which is close to the maximum recommended size of {max_rec_size.in_float_mb:.1f} "
+            "MB. This can be slow. See the documentation for possible work-arounds: "
+            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+        )
+    mx.set_wired_limit(max_rec_size.in_bytes)
+    logger.info(f"Wired limit set to {max_rec_size}.")
+
+
+def mlx_cleanup(
+    model: Model | None,
+    tokenizer: TokenizerWrapper | None,
+    group: mx.distributed.Group | None,
+) -> None:
+    del model, tokenizer, group
+    mx.clear_cache()
+    import gc
+
+    gc.collect()
+
+
+def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
+    if group is None:
+        return bool_
+    num_true = mx.distributed.all_sum(
+        mx.array(bool_), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+    )
+    mx.eval(num_true)
+    return num_true.item() > 0
+
+
+def use_generation_stream_by_default() -> None:
+    """Make mlx-lm's generation stream this thread's default GPU stream, so every GPU op the runner
+    makes, mlx-lm's and exo's, runs on that one stream.
+
+    With MLX_METAL_FAST_SYNCH, a GPU op that needs the result of one on another GPU stream spins on
+    the GPU until it is there. In a tensor-parallel eval, whose GPU work also spins waiting on the
+    communication stream, two GPU streams waiting on each other like this deadlock. exo's own ops
+    (prefix cache copies, snapshots, trims) ran on the default stream while mlx-lm runs the model on
+    its generation stream, so both streams met in the model's evals."""
+    with mx.stream(generation_stream):
+        stream = mx.default_stream(mx.default_device())
+    mx.set_default_stream(stream)
+
+
+def mx_barrier(group: mx.distributed.Group | None):
+    if group is None:
+        return
+    mx.eval(
+        mx.distributed.all_sum(
+            mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+        )
+    )
+
+
+def mx_all_gather_tasks(
+    tasks: list[TextGeneration],
+    group: mx.distributed.Group | None,
+) -> tuple[list[TextGeneration], list[TextGeneration]]:
+    def encode_task_id(task_id: TaskId) -> list[int]:
+        utf8_task_id = task_id.encode()
+        return [
+            int.from_bytes(utf8_task_id[i : i + 1]) for i in range(len(utf8_task_id))
+        ]
+
+    def decode_task_id(encoded_task_id: list[int]) -> TaskId:
+        return TaskId(
+            bytes.decode(b"".join((x).to_bytes(length=1) for x in encoded_task_id))
+        )
+
+    uuid_byte_length = 36
+
+    n_tasks = len(tasks)
+    all_counts = cast(
+        list[int],
+        mx.distributed.all_gather(mx.array([n_tasks]), group=group).tolist(),
+    )
+    max_tasks = max(all_counts)
+    world_size: int = 1 if group is None else group.size()
+
+    if max_tasks == 0:
+        return [], []
+
+    padded = [encode_task_id(task.task_id) for task in tasks] + [
+        [0] * uuid_byte_length
+    ] * (max_tasks - n_tasks)
+
+    assert all(len(encoded_task_id) == uuid_byte_length for encoded_task_id in padded)
+
+    gathered_ids = mx.distributed.all_gather(mx.array(padded), group=group)
+    # On the CPU before the reshape, a GPU op (see PipelineLastLayer)
+    mx.eval(gathered_ids)
+    gathered = cast(
+        list[list[list[int]]],
+        gathered_ids.reshape(world_size, max_tasks, -1).tolist(),
+    )
+    all_task_ids: list[list[TaskId]] = [
+        [decode_task_id(encoded_task_id) for encoded_task_id in rank_tasks[:count]]
+        for rank_tasks, count in zip(gathered, all_counts, strict=True)
+    ]
+
+    agreed_ids = set[TaskId].intersection(*(set(tids) for tids in all_task_ids))
+
+    local_tasks = {task.task_id: task for task in tasks}
+    agreed = [local_tasks[tid] for tid in sorted(agreed_ids)]
+    different = [task for task in tasks if task.task_id not in agreed_ids]
+    return agreed, different

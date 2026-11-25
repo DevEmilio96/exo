@@ -1,0 +1,721 @@
+import copy
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+
+from loguru import logger
+
+from exo.shared.models.model_cards import ModelCard
+from exo.shared.types.common import DeploymentId, ModelId, NodeId
+from exo.shared.types.deployments import (
+    CRASH_LOOP_WINDOW,
+    REMOVED_DEPLOYMENTS_KEPT,
+    Deployment,
+)
+from exo.shared.types.events import (
+    CustomModelCardAdded,
+    CustomModelCardDeleted,
+    DeploymentCreated,
+    DeploymentHeld,
+    DeploymentRemoved,
+    DeploymentResumed,
+    DeploymentStatus,
+    Event,
+    IndexedEvent,
+    InstanceCreated,
+    InstanceDeleted,
+    InstanceLinkCreated,
+    InstanceLinkDeleted,
+    NodeDownloadProgress,
+    NodeGatheredInfo,
+    NodeLeft,
+    NodeTimedOut,
+    RunnerStatusUpdated,
+    TaskAcknowledged,
+    TaskCreated,
+    TaskDeleted,
+    TaskFailed,
+    TaskStatusUpdated,
+    TestEvent,
+    TopologyEdgeCreated,
+    TopologyEdgeDeleted,
+    TracesCollected,
+)
+from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
+from exo.shared.types.profiling import (
+    NodeIdentity,
+    NodeNetworkInfo,
+    NodeRdmaCtlStatus,
+    NodeThunderboltInfo,
+    ThunderboltBridgeStatus,
+)
+from exo.shared.types.state import State
+from exo.shared.types.tasks import (
+    Task,
+    TaskId,
+    TaskStatus,
+)
+from exo.shared.types.topology import Connection, RDMAConnection
+from exo.shared.types.worker.downloads import DownloadProgress, is_not_on_disk
+from exo.shared.types.worker.instances import Instance, InstanceId
+from exo.shared.types.worker.runners import (
+    RunnerId,
+    RunnerReady,
+    RunnerShutdown,
+    RunnerStatus,
+)
+from exo.utils.info_gatherer.info_gatherer import (
+    MacmonMetrics,
+    MacThunderboltConnections,
+    MacThunderboltIdentifiers,
+    MemoryUsage,
+    MiscData,
+    NodeBackends,
+    NodeConfig,
+    NodeDiskUsage,
+    NodeNetworkInterfaces,
+    RdmaCtlStatus,
+    StaticNodeInformation,
+    ThunderboltBridgeInfo,
+)
+
+
+def _is_rdma_ctl_enabled(
+    node_id: NodeId, node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus]
+) -> bool:
+    """A node is RDMA-capable only if rdma_ctl status has been observed as enabled.
+
+    Missing entries default to ``False`` — if we have not yet observed (or the node
+    cannot run) ``rdma_ctl``, it must not participate in an RDMA-backed instance.
+    """
+    status = node_rdma_ctl.get(node_id)
+    return status is not None and status.enabled
+
+
+def event_apply(event: Event, state: State) -> State:
+    """Apply an event to state."""
+    match event:
+        case (
+            TestEvent() | TaskAcknowledged() | TracesCollected()
+        ):  # Pass-through events that don't modify state
+            return state
+        case CustomModelCardAdded():
+            return apply_custom_model_card_added(event, state)
+        case CustomModelCardDeleted():
+            return apply_custom_model_card_deleted(event, state)
+        case InstanceCreated():
+            return apply_instance_created(event, state)
+        case InstanceDeleted():
+            return apply_instance_deleted(event, state)
+        case DeploymentCreated():
+            return apply_deployment_created(event, state)
+        case DeploymentRemoved():
+            return apply_deployment_removed(event, state)
+        case DeploymentHeld():
+            # A hold is the master's, not the user's: it leaves the revision as it is
+            return _update_deployment(
+                state,
+                event.deployment_id,
+                lambda deployment: {"hold": event.hold, "waiting": None},
+            )
+        case DeploymentResumed():
+            # A fresh start: what held it or made it wait, and the losses that count towards
+            # a crash loop, are cleared. One that failed to start isn't sent back to the
+            # nodes it failed on, and pins the user can't have now are dropped.
+            return _update_deployment(
+                state,
+                event.deployment_id,
+                lambda deployment: {
+                    "hold": None,
+                    "revision": deployment.revision + (1 if event.by_user else 0),
+                    "not_before": None,
+                    "losses": [],
+                    "waiting": None,
+                    "lost_at": event.at,
+                    "last_nodes": []
+                    if deployment.hold is not None
+                    and deployment.hold.kind == "StartFailed"
+                    else deployment.last_nodes,
+                    "spec": deployment.spec.model_copy(update={"pinned_nodes": []})
+                    if event.unpin
+                    else deployment.spec,
+                },
+            )
+        case DeploymentStatus():
+            return _update_deployment(
+                state,
+                event.deployment_id,
+                lambda _: {"waiting": event.waiting, "note": event.note},
+            )
+        case NodeTimedOut() | NodeLeft():
+            return apply_node_timed_out(event, state)
+        case NodeDownloadProgress():
+            return apply_node_download_progress(event, state)
+        case NodeGatheredInfo():
+            return apply_node_gathered_info(event, state)
+        case RunnerStatusUpdated():
+            return apply_runner_status_updated(event, state)
+        case TaskCreated():
+            return apply_task_created(event, state)
+        case TaskDeleted():
+            return apply_task_deleted(event, state)
+        case TaskFailed():
+            return apply_task_failed(event, state)
+        case TaskStatusUpdated():
+            return apply_task_status_updated(event, state)
+        case TopologyEdgeCreated():
+            return apply_topology_edge_created(event, state)
+        case TopologyEdgeDeleted():
+            return apply_topology_edge_deleted(event, state)
+        case InstanceLinkCreated():
+            return apply_instance_link_created(event, state)
+        case InstanceLinkDeleted():
+            return apply_instance_link_deleted(event, state)
+
+
+def apply(state: State, event: IndexedEvent) -> State:
+    # Just to test that events are only applied in correct order
+    if state.last_event_applied_idx != event.idx - 1:
+        logger.warning(
+            f"Expected event {state.last_event_applied_idx + 1} but received {event.idx}"
+        )
+    assert state.last_event_applied_idx == event.idx - 1
+    new_state: State = event_apply(event.event, state)
+    return new_state.model_copy(update={"last_event_applied_idx": event.idx})
+
+
+def apply_node_download_progress(event: NodeDownloadProgress, state: State) -> State:
+    """
+    Update or add a node download progress to state. A model that isn't on the node at
+    all (Pending with no bytes) is left out, and removed if it was listed.
+    """
+    dp = event.download_progress
+    node_id = dp.node_id
+
+    current = list(state.downloads.get(node_id, ()))
+    # TODO(ciaran): deduplicate by model_id for now. Will need to use
+    # shard_metadata again when pipeline and tensor downloads differ.
+    # For now this is fine
+    listed = next(
+        (
+            i
+            for i, existing_dp in enumerate(current)
+            if existing_dp.shard_metadata.model_card.model_id
+            == dp.shard_metadata.model_card.model_id
+        ),
+        None,
+    )
+    if is_not_on_disk(dp):
+        if listed is None:
+            return state
+        del current[listed]
+    elif listed is None:
+        current.append(dp)
+    else:
+        current[listed] = dp
+
+    new_downloads: Mapping[NodeId, Sequence[DownloadProgress]] = (
+        {**state.downloads, node_id: current}
+        if current
+        else {key: value for key, value in state.downloads.items() if key != node_id}
+    )
+    return state.model_copy(update={"downloads": new_downloads})
+
+
+def apply_task_created(event: TaskCreated, state: State) -> State:
+    if event.task.instance_id not in state.instances:
+        # A worker's own task (stopping a runner, say) for an instance deleted just before: the
+        # deletion that removes an instance's tasks has already been applied, so only the
+        # worker's report that it finished would remove it, and a worker that stops first (its
+        # node quitting) never sends that. The worker carries the task out either way. Every
+        # normal stop leaves one of these (the Shutdown the worker plans because the instance
+        # left the state).
+        logger.debug(
+            f"Not adding task {event.task_id}: its instance "
+            f"{event.task.instance_id} no longer exists"
+        )
+        return state
+    new_tasks: Mapping[TaskId, Task] = {**state.tasks, event.task_id: event.task}
+    return state.model_copy(update={"tasks": new_tasks})
+
+
+def apply_task_deleted(event: TaskDeleted, state: State) -> State:
+    new_tasks: Mapping[TaskId, Task] = {
+        tid: task for tid, task in state.tasks.items() if tid != event.task_id
+    }
+    return state.model_copy(update={"tasks": new_tasks})
+
+
+def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
+    if event.task_id not in state.tasks:
+        # maybe should raise
+        return state
+
+    task = state.tasks[event.task_id]
+    if event.task_status == TaskStatus.Complete:
+        # A worker's own bookkeeping task (creating, loading or warming up a runner...) is
+        # of no further use once it completes, and nothing else removes it. (Requests are
+        # never in the state: exo.worker.serving.)
+        new_tasks: Mapping[TaskId, Task] = {
+            tid: t for tid, t in state.tasks.items() if tid != event.task_id
+        }
+        return state.model_copy(update={"tasks": new_tasks})
+
+    update: dict[str, TaskStatus | None] = {
+        "task_status": event.task_status,
+    }
+    if event.task_status != TaskStatus.Failed:
+        update["error_type"] = None
+        update["error_message"] = None
+
+    updated_task = task.model_copy(update=update)
+    new_tasks = {**state.tasks, event.task_id: updated_task}
+    return state.model_copy(update={"tasks": new_tasks})
+
+
+def apply_task_failed(event: TaskFailed, state: State) -> State:
+    if event.task_id not in state.tasks:
+        # maybe should raise
+        return state
+
+    updated_task = state.tasks[event.task_id].model_copy(
+        update={"error_type": event.error_type, "error_message": event.error_message}
+    )
+    new_tasks: Mapping[TaskId, Task] = {**state.tasks, event.task_id: updated_task}
+    return state.model_copy(update={"tasks": new_tasks})
+
+
+def apply_instance_created(event: InstanceCreated, state: State) -> State:
+    instance = event.instance
+    new_instances: Mapping[InstanceId, Instance] = {
+        **state.instances,
+        instance.instance_id: instance,
+    }
+    state = state.model_copy(update={"instances": new_instances})
+    # Placed: nothing to wait for
+    return _update_deployment(
+        state,
+        instance.deployment_id,
+        lambda _: {
+            "not_before": None,
+            "waiting": None,
+            "lost_at": None,
+        },
+    )
+
+
+def apply_deployment_created(event: DeploymentCreated, state: State) -> State:
+    """A new deployment, or a node's record of one with a later change by the user (a resume):
+    that change wins, and clears what this master held it for. The master's own bookkeeping
+    (where it ran, losses) is kept. A stopped deployment never comes back."""
+    new = event.deployment
+    if new.deployment_id in state.removed_deployments:
+        return state
+    current = state.deployments.get(new.deployment_id)
+    if current is None:
+        return _with_deployments(state, {**state.deployments, new.deployment_id: new})
+    if new.revision <= current.revision:
+        return state
+    return _update_deployment(
+        state,
+        new.deployment_id,
+        lambda _: {
+            "revision": new.revision,
+            "spec": new.spec,
+            "model_card": new.model_card,
+            "hold": None,
+            "waiting": None,
+        },
+    )
+
+
+def apply_deployment_removed(event: DeploymentRemoved, state: State) -> State:
+    removed = sorted(
+        {**state.removed_deployments, event.deployment_id: event.at}.items(),
+        key=lambda item: item[1],
+    )[-REMOVED_DEPLOYMENTS_KEPT:]
+    return state.model_copy(
+        update={
+            "deployments": {
+                deployment_id: deployment
+                for deployment_id, deployment in state.deployments.items()
+                if deployment_id != event.deployment_id
+            },
+            "removed_deployments": dict(removed),
+        }
+    )
+
+
+def _with_deployments(
+    state: State, deployments: Mapping[DeploymentId, Deployment]
+) -> State:
+    return state.model_copy(update={"deployments": deployments})
+
+
+def _update_deployment(
+    state: State,
+    deployment_id: DeploymentId,
+    update: Callable[[Deployment], dict[str, object]],
+) -> State:
+    """The state with a deployment changed; unchanged if it doesn't have that deployment."""
+    deployment = state.deployments.get(deployment_id)
+    if deployment is None:
+        return state
+    return _with_deployments(
+        state,
+        {
+            **state.deployments,
+            deployment_id: deployment.model_copy(update=update(deployment)),
+        },
+    )
+
+
+def _losses_after(deployment: Deployment, event: InstanceDeleted) -> list[str]:
+    """The deployment's losses within CRASH_LOOP_WINDOW of this one, this one included."""
+    at = datetime.fromisoformat(event.at)
+    return [
+        loss
+        for loss in deployment.losses
+        if at - datetime.fromisoformat(loss) < CRASH_LOOP_WINDOW
+    ] + [event.at]
+
+
+def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
+    new_instances: Mapping[InstanceId, Instance] = {
+        iid: inst for iid, inst in state.instances.items() if iid != event.instance_id
+    }
+    # The instance's runners go with it: a runner being shut down rarely gets to report
+    # that it has, and one on a node that died never will
+    deleted = state.instances.get(event.instance_id)
+    gone: set[RunnerId] = (
+        set(deleted.shard_assignments.runner_to_shard) if deleted is not None else set()
+    )
+    new_runners: Mapping[RunnerId, RunnerStatus] = {
+        rid: rs for rid, rs in state.runners.items() if rid not in gone
+    }
+    new_ports: Mapping[RunnerId, int] = {
+        rid: p for rid, p in state.prefill_server_ports.items() if rid not in gone
+    }
+    new_links: dict[InstanceLinkId, InstanceLink] = {}
+    for link_id, link in state.instance_links.items():
+        prefill = [i for i in link.prefill_instances if i != event.instance_id]
+        decode = [i for i in link.decode_instances if i != event.instance_id]
+        if not prefill or not decode:
+            continue
+        if prefill == list(link.prefill_instances) and decode == list(
+            link.decode_instances
+        ):
+            new_links[link_id] = link
+        else:
+            new_links[link_id] = link.model_copy(
+                update={"prefill_instances": prefill, "decode_instances": decode}
+            )
+    # The instance's bookkeeping tasks (e.g. a runner that failed to load) are of no use once
+    # it's gone
+    new_tasks: Mapping[TaskId, Task] = {
+        tid: task
+        for tid, task in state.tasks.items()
+        if task.instance_id != event.instance_id
+    }
+    state = state.model_copy(
+        update={
+            "instances": new_instances,
+            "instance_links": new_links,
+            "tasks": new_tasks,
+            "runners": new_runners,
+            "prefill_server_ports": new_ports,
+        }
+    )
+    if deleted is None:
+        return state
+    if event.reason == "Duplicate":
+        # Its deployment runs on as its other instance
+        return state
+    # Its deployment remembers where it ran, as a preference for its next placement. A lost
+    # node counts towards a crash loop: a model that takes its node down as it loads would
+    # otherwise be loaded again forever
+    return _update_deployment(
+        state,
+        deleted.deployment_id,
+        lambda deployment: {
+            "last_nodes": list(deleted.shard_assignments.node_to_runner),
+            "not_before": event.not_before,
+            "lost_at": event.at,
+            "losses": _losses_after(deployment, event)
+            if event.reason == "NodeLost"
+            else deployment.losses,
+        },
+    )
+
+
+def apply_instance_link_created(event: InstanceLinkCreated, state: State) -> State:
+    new_links: Mapping[InstanceLinkId, InstanceLink] = {
+        **state.instance_links,
+        event.link.link_id: event.link,
+    }
+    return state.model_copy(update={"instance_links": new_links})
+
+
+def apply_instance_link_deleted(event: InstanceLinkDeleted, state: State) -> State:
+    new_links: Mapping[InstanceLinkId, InstanceLink] = {
+        lid: link for lid, link in state.instance_links.items() if lid != event.link_id
+    }
+    return state.model_copy(update={"instance_links": new_links})
+
+
+def apply_runner_status_updated(event: RunnerStatusUpdated, state: State) -> State:
+    if isinstance(event.runner_status, RunnerShutdown):
+        new_runners: Mapping[RunnerId, RunnerStatus] = {
+            rid: rs for rid, rs in state.runners.items() if rid != event.runner_id
+        }
+        new_ports: Mapping[RunnerId, int] = {
+            rid: p
+            for rid, p in state.prefill_server_ports.items()
+            if rid != event.runner_id
+        }
+        return state.model_copy(
+            update={"runners": new_runners, "prefill_server_ports": new_ports}
+        )
+    if not any(
+        event.runner_id in instance.shard_assignments.runner_to_shard
+        for instance in state.instances.values()
+    ):
+        # A runner of an instance that has been deleted, reporting as it shuts down: the
+        # state only keeps the runners of the instances it has
+        return state
+    new_runners = {
+        **state.runners,
+        event.runner_id: event.runner_status,
+    }
+    update: dict[str, object] = {"runners": new_runners}
+    if (
+        isinstance(event.runner_status, RunnerReady)
+        and event.runner_status.prefill_server_port is not None
+    ):
+        update["prefill_server_ports"] = {
+            **state.prefill_server_ports,
+            event.runner_id: event.runner_status.prefill_server_port,
+        }
+    return state.model_copy(update=update)
+
+
+def apply_node_timed_out(event: NodeTimedOut | NodeLeft, state: State) -> State:
+    topology = copy.deepcopy(state.topology)
+    topology.remove_node(event.node_id)
+    last_seen = {
+        key: value for key, value in state.last_seen.items() if key != event.node_id
+    }
+    downloads = {
+        key: value for key, value in state.downloads.items() if key != event.node_id
+    }
+    # Clean up all granular node mappings
+    node_memory = {
+        key: value for key, value in state.node_memory.items() if key != event.node_id
+    }
+    node_disk = {
+        key: value for key, value in state.node_disk.items() if key != event.node_id
+    }
+    node_system = {
+        key: value for key, value in state.node_system.items() if key != event.node_id
+    }
+    node_network = {
+        key: value for key, value in state.node_network.items() if key != event.node_id
+    }
+    node_thunderbolt = {
+        key: value
+        for key, value in state.node_thunderbolt.items()
+        if key != event.node_id
+    }
+    node_thunderbolt_bridge = {
+        key: value
+        for key, value in state.node_thunderbolt_bridge.items()
+        if key != event.node_id
+    }
+    node_rdma_ctl = {
+        key: value for key, value in state.node_rdma_ctl.items() if key != event.node_id
+    }
+    node_identities = {
+        key: value
+        for key, value in state.node_identities.items()
+        if key != event.node_id
+    }
+    # Only recompute cycles if the leaving node had TB bridge enabled
+    leaving_node_status = state.node_thunderbolt_bridge.get(event.node_id)
+    leaving_node_had_tb_enabled = (
+        leaving_node_status is not None and leaving_node_status.enabled
+    )
+    thunderbolt_bridge_cycles = (
+        topology.get_thunderbolt_bridge_cycles(node_thunderbolt_bridge, node_network)
+        if leaving_node_had_tb_enabled
+        else [list(cycle) for cycle in state.thunderbolt_bridge_cycles]
+    )
+    return state.model_copy(
+        update={
+            "downloads": downloads,
+            "topology": topology,
+            "last_seen": last_seen,
+            "node_memory": node_memory,
+            "node_disk": node_disk,
+            "node_system": node_system,
+            "node_network": node_network,
+            "node_thunderbolt": node_thunderbolt,
+            "node_thunderbolt_bridge": node_thunderbolt_bridge,
+            "node_rdma_ctl": node_rdma_ctl,
+            "node_identities": node_identities,
+            "thunderbolt_bridge_cycles": thunderbolt_bridge_cycles,
+        }
+    )
+
+
+def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
+    topology = copy.deepcopy(state.topology)
+    topology.add_node(event.node_id)
+    info = event.info
+
+    # Build update dict with only the mappings that change
+    update: dict[str, object] = {
+        "last_seen": {
+            **state.last_seen,
+            event.node_id: datetime.fromisoformat(event.when),
+        },
+        "topology": topology,
+    }
+
+    match info:
+        case MacmonMetrics():
+            update["node_system"] = {
+                **state.node_system,
+                event.node_id: info.system_profile,
+            }
+            update["node_memory"] = {**state.node_memory, event.node_id: info.memory}
+        case MemoryUsage():
+            update["node_memory"] = {**state.node_memory, event.node_id: info}
+        case NodeDiskUsage():
+            update["node_disk"] = {**state.node_disk, event.node_id: info.disk_usage}
+        case NodeConfig():
+            pass
+        case MiscData():
+            current_identity = state.node_identities.get(event.node_id, NodeIdentity())
+            new_identity = current_identity.model_copy(
+                update={"friendly_name": info.friendly_name}
+            )
+            update["node_identities"] = {
+                **state.node_identities,
+                event.node_id: new_identity,
+            }
+        case StaticNodeInformation():
+            current_identity = state.node_identities.get(event.node_id, NodeIdentity())
+            new_identity = current_identity.model_copy(
+                update={
+                    "model_id": info.model,
+                    "chip_id": info.chip,
+                    "os_version": info.os_version,
+                    "os_build_version": info.os_build_version,
+                }
+            )
+            update["node_identities"] = {
+                **state.node_identities,
+                event.node_id: new_identity,
+            }
+        case NodeNetworkInterfaces():
+            update["node_network"] = {
+                **state.node_network,
+                event.node_id: NodeNetworkInfo(interfaces=info.ifaces),
+            }
+        case MacThunderboltIdentifiers():
+            update["node_thunderbolt"] = {
+                **state.node_thunderbolt,
+                event.node_id: NodeThunderboltInfo(interfaces=info.idents),
+            }
+        case MacThunderboltConnections():
+            conn_map = {
+                tb_ident.domain_uuid: (nid, tb_ident.rdma_interface)
+                for nid in state.node_thunderbolt
+                for tb_ident in state.node_thunderbolt[nid].interfaces
+            }
+            source_is_rdma_enabled = _is_rdma_ctl_enabled(
+                event.node_id, state.node_rdma_ctl
+            )
+            as_rdma_conns = [
+                Connection(
+                    source=event.node_id,
+                    sink=conn_map[tb_conn.sink_uuid][0],
+                    edge=RDMAConnection(
+                        source_rdma_iface=conn_map[tb_conn.source_uuid][1],
+                        sink_rdma_iface=conn_map[tb_conn.sink_uuid][1],
+                    ),
+                )
+                for tb_conn in info.conns
+                if tb_conn.source_uuid in conn_map
+                if tb_conn.sink_uuid in conn_map
+                if source_is_rdma_enabled
+                and _is_rdma_ctl_enabled(
+                    conn_map[tb_conn.sink_uuid][0], state.node_rdma_ctl
+                )
+            ]
+            topology.replace_all_out_rdma_connections(event.node_id, as_rdma_conns)
+        case ThunderboltBridgeInfo():
+            new_tb_bridge: dict[NodeId, ThunderboltBridgeStatus] = {
+                **state.node_thunderbolt_bridge,
+                event.node_id: info.status,
+            }
+            update["node_thunderbolt_bridge"] = new_tb_bridge
+            # Only recompute cycles if the enabled status changed
+            old_status = state.node_thunderbolt_bridge.get(event.node_id)
+            old_enabled = old_status.enabled if old_status else False
+            new_enabled = info.status.enabled
+            if old_enabled != new_enabled:
+                update["thunderbolt_bridge_cycles"] = (
+                    topology.get_thunderbolt_bridge_cycles(
+                        new_tb_bridge, state.node_network
+                    )
+                )
+        case RdmaCtlStatus():
+            update["node_rdma_ctl"] = {
+                **state.node_rdma_ctl,
+                event.node_id: NodeRdmaCtlStatus(enabled=info.enabled),
+            }
+            # If RDMA just got disabled on this node, drop any RDMA edges touching it
+            # so placement / topology consumers cannot pick a disabled node for an
+            # RDMA-backed instance. (Edges will repopulate on the next
+            # MacThunderboltConnections poll once both endpoints are enabled again.)
+            if not info.enabled:
+                topology.remove_all_rdma_connections_touching(event.node_id)
+        case NodeBackends():
+            update["node_backends"] = {
+                **state.node_backends,
+                event.node_id: info.backends,
+            }
+
+    return state.model_copy(update=update)
+
+
+def apply_topology_edge_created(event: TopologyEdgeCreated, state: State) -> State:
+    topology = copy.deepcopy(state.topology)
+    topology.add_connection(event.conn)
+    return state.model_copy(update={"topology": topology})
+
+
+def apply_topology_edge_deleted(event: TopologyEdgeDeleted, state: State) -> State:
+    topology = copy.deepcopy(state.topology)
+    topology.remove_connection(event.conn)
+    # TODO: Clean up removing the reverse connection
+    return state.model_copy(update={"topology": topology})
+
+
+def apply_custom_model_card_added(event: CustomModelCardAdded, state: State) -> State:
+    new_cards: Mapping[ModelId, ModelCard] = {
+        **state.custom_model_cards,
+        event.model_card.model_id: event.model_card,
+    }
+    return state.model_copy(update={"custom_model_cards": new_cards})
+
+
+def apply_custom_model_card_deleted(
+    event: CustomModelCardDeleted, state: State
+) -> State:
+    new_cards: Mapping[ModelId, ModelCard] = {
+        model_id: card
+        for model_id, card in state.custom_model_cards.items()
+        if model_id != event.model_id
+    }
+    return state.model_copy(update={"custom_model_cards": new_cards})

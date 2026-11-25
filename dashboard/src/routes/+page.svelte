@@ -1,0 +1,8371 @@
+<script lang="ts">
+  import { exoYellow } from "$lib/utils/brand_colors";
+  import {
+    describeDevice,
+    pollDevicesOnOtherVersions,
+    type DeviceOnOtherVersion,
+  } from "$lib/utils/other_versions";
+  import {
+    TopologyGraph,
+    ChatForm,
+    ChatMessages,
+    ChatSidebar,
+    ModelCard,
+    ModelPickerModal,
+    ChatModelSelector,
+  } from "$lib/components";
+  import {
+    pickAutoModel,
+    getAutoTierIndex,
+  } from "$lib/components/ChatModelSelector.svelte";
+  import {
+    favorites,
+    toggleFavorite,
+    getFavoritesSet,
+  } from "$lib/stores/favorites.svelte";
+  import {
+    hasRecents,
+    getRecentModelIds,
+    recordRecentLaunch,
+  } from "$lib/stores/recents.svelte";
+  import {
+    hasStartedChat,
+    isTopologyMinimized,
+    topologyData,
+    lastUpdate,
+    clearChat,
+    instances,
+    deployments,
+    runners,
+    downloads,
+    nodeDisk,
+    placementPreviews,
+    selectedPreviewModelId,
+    isLoadingPreviews,
+    selectPreviewModel,
+    togglePreviewNodeFilter,
+    clearPreviewNodeFilter,
+    previewNodeFilter,
+    createConversation,
+    setSelectedChatModel,
+    selectedChatModel,
+    sendMessage,
+    thinkingEnabled,
+    generateImage,
+    editImage,
+    editingImage,
+    messages,
+    debugMode,
+    toggleDebugMode,
+    topologyOnlyMode,
+    toggleTopologyOnlyMode,
+    chatSidebarVisible,
+    toggleChatSidebarVisible,
+    mobileChatSidebarOpen,
+    toggleMobileChatSidebar,
+    setMobileChatSidebarOpen,
+    mobileRightSidebarOpen,
+    toggleMobileRightSidebar,
+    setMobileRightSidebarOpen,
+    nodeThunderbolt,
+    nodeRdmaCtl,
+    thunderboltBridgeCycles,
+    nodeThunderboltBridge,
+    nodeIdentities,
+    nodeHeardAt,
+    downloadActivity,
+    type DownloadProgress,
+    type NodeInfo,
+    type PlacementPreview,
+  } from "$lib/stores/app.svelte";
+  import {
+    addToast,
+    dismissByMessage,
+    dismissToast,
+  } from "$lib/stores/toast.svelte";
+  import {
+    launchConstraints,
+    onboardingDecision,
+    parseDeployments,
+    runningNotes,
+    type Deployment,
+  } from "$lib/utils/deployments";
+  import { readApiErrorMessage } from "$lib/utils/api_errors";
+  import HeaderNav from "$lib/components/HeaderNav.svelte";
+  import DeviceIcon from "$lib/components/DeviceIcon.svelte";
+  import { fade, fly, slide } from "svelte/transition";
+  import { tweened } from "svelte/motion";
+  import { cubicInOut, cubicOut } from "svelte/easing";
+  import { onMount } from "svelte";
+  import {
+    DEVICE_SILENCE_MS,
+    checkInstanceHealth,
+    describeInstanceHealth,
+  } from "$lib/utils/instance_health";
+  import {
+    totalDownload,
+    type NodeDownload,
+  } from "$lib/utils/download_progress";
+  import {
+    describeStall,
+    describeStalls,
+    downloadKey,
+    estimateRemainingMs,
+    isStalled,
+  } from "$lib/utils/download_activity";
+  import {
+    getNodesWithModelDownloaded,
+    indexModelDownloads,
+  } from "$lib/utils/downloads";
+  import {
+    checkDiskFit,
+    describeDiskFit,
+    type DiskFit,
+  } from "$lib/utils/disk_fit";
+  import { devicesMissingRdma } from "$lib/utils/rdma";
+  import type { ChatUploadedFile } from "$lib/types/files";
+
+  const chatStarted = $derived(hasStartedChat());
+  const minimized = $derived(isTopologyMinimized());
+  const data = $derived(topologyData());
+  const update = $derived(lastUpdate());
+  const instanceData = $derived(instances());
+  const runnersData = $derived(runners());
+  const downloadsData = $derived(downloads());
+  const nodeDiskData = $derived(nodeDisk());
+  const previewsData = $derived(placementPreviews());
+  const selectedModelId = $derived(selectedPreviewModelId());
+  const loadingPreviews = $derived(isLoadingPreviews());
+  const debugEnabled = $derived(debugMode());
+  const topologyOnlyEnabled = $derived(topologyOnlyMode());
+  const sidebarVisible = $derived(chatSidebarVisible());
+  const mobileChatOpen = $derived(mobileChatSidebarOpen());
+  const mobileRightOpen = $derived(mobileRightSidebarOpen());
+  const tbBridgeCycles = $derived(thunderboltBridgeCycles());
+  const tbBridgeData = $derived(nodeThunderboltBridge());
+  const identitiesData = $derived(nodeIdentities());
+  const tbIdentifiers = $derived(nodeThunderbolt());
+  const rdmaCtlData = $derived(nodeRdmaCtl());
+  const nodeFilter = $derived(previewNodeFilter());
+  // The deployment an instance runs for
+  function deploymentIdOf(instance: unknown): string | null {
+    const [, inner] = getTagged(instance);
+    const id = (inner as { deploymentId?: unknown } | null)?.deploymentId;
+    return typeof id === "string" ? id : null;
+  }
+  const allDeployments = $derived(
+    parseDeployments(
+      deployments(),
+      new Set(
+        Object.values(instanceData).flatMap((instance) => {
+          const id = deploymentIdOf(instance);
+          return id === null ? [] : [id];
+        }),
+      ),
+      Date.now(),
+    ),
+  );
+  // Models users launched that have no running instance: starting again,
+  // waiting for something, or paused until the user resumes them
+  const pendingDeployments = $derived(
+    allDeployments.filter((deployment) => deployment.phase.kind !== "running"),
+  );
+  // How the running ones run, when it matters (e.g. over TCP instead of RDMA)
+  const notesOfRunning = $derived(runningNotes(allDeployments));
+  function runningNoteOf(instance: unknown): string | undefined {
+    const id = deploymentIdOf(instance);
+    return id === null ? undefined : notesOfRunning.get(id);
+  }
+  const heardAtData = $derived(nodeHeardAt());
+  const downloadActivityData = $derived(downloadActivity());
+
+  // Aggregate active download progress across all instances for header indicator
+  const activeDownloadSummary = $derived.by(() => {
+    let totalBytes = 0;
+    let downloadedBytes = 0;
+    let count = 0;
+    for (const [id, inst] of Object.entries(instanceData)) {
+      const status = getInstanceDownloadStatus(id, inst);
+      if (status.isDownloading && status.progress) {
+        count++;
+        totalBytes += status.progress.totalBytes || 0;
+        downloadedBytes += status.progress.downloadedBytes || 0;
+      }
+    }
+    if (count === 0) return null;
+    return {
+      count,
+      percentage: totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0,
+    };
+  });
+
+  // Detect macOS version mismatches across cluster nodes
+  const macosVersionMismatch = $derived.by(() => {
+    if (!identitiesData) return null;
+    const entries = Object.entries(identitiesData);
+    // Filter to macOS nodes (version starts with a digit, e.g. "15.3")
+    const macosNodes = entries.filter(([_, id]) => {
+      const v = id.osVersion;
+      return v && v !== "Unknown" && /^\d/.test(v);
+    });
+    if (macosNodes.length < 2) return null;
+    // Compare on buildVersion for precise mismatch detection
+    const buildVersions = new Set(
+      macosNodes.map(([_, id]) => id.osBuildVersion ?? id.osVersion),
+    );
+    if (buildVersions.size <= 1) return null;
+    return macosNodes.map(([nodeId, id]) => ({
+      nodeId,
+      friendlyName: getNodeName(nodeId),
+      version: id.osVersion!,
+      buildVersion: id.osBuildVersion ?? "Unknown",
+    }));
+  });
+
+  // Devices under this cluster's name that can't join it: they run another
+  // version of exo
+  let devicesOnOtherVersions = $state<DeviceOnOtherVersion[]>([]);
+  $effect(() =>
+    pollDevicesOnOtherVersions((devices) => {
+      devicesOnOtherVersions = devices;
+    }),
+  );
+
+  // Dismissed RDMA warnings stay dismissed across reloads (in this browser).
+  // A new key for "RDMA not enabled": the old one was set by dismissing the
+  // warning that showed for any Thunderbolt hardware, and must not hide the
+  // one for devices actually cabled with Thunderbolt 5.
+  const RDMA_NOT_ENABLED_DISMISSED_KEY =
+    "exo-rdma-not-enabled-thunderbolt-link-dismissed";
+  const RDMA_INCOMPATIBLE_PORT_DISMISSED_KEY =
+    "exo-rdma-incompatible-port-dismissed";
+
+  function loadWarningDismissed(key: string): boolean {
+    try {
+      return localStorage.getItem(key) === "true";
+    } catch {
+      // Storage unavailable: show the warning
+      return false;
+    }
+  }
+
+  function saveWarningDismissed(key: string): void {
+    try {
+      localStorage.setItem(key, "true");
+    } catch {
+      // Storage unavailable: the dismissal lasts until the page reloads
+    }
+  }
+
+  // Devices connected with Thunderbolt 5 cables that don't have RDMA on.
+  // Having Thunderbolt ports isn't enough (every recent Mac has them): a
+  // cluster on Ethernet or Wi-Fi has nothing to enable (see rdma.ts).
+  const tb5WithoutRdma = $derived.by(() => {
+    if (!rdmaCtlData || !tbIdentifiers) return false;
+    return devicesMissingRdma(tbIdentifiers, rdmaCtlData).length > 0;
+  });
+  let tb5InfoDismissed = $state(
+    loadWarningDismissed(RDMA_NOT_ENABLED_DISMISSED_KEY),
+  );
+  function dismissTb5Info() {
+    tb5InfoDismissed = true;
+    saveWarningDismissed(RDMA_NOT_ENABLED_DISMISSED_KEY);
+  }
+
+  // Detect Mac Studio nodes using RDMA on en2 (the port next to ethernet — RDMA doesn't work there)
+  const macStudioEn2RdmaWarning = $derived.by(() => {
+    const edges = data?.edges;
+    const ids = tbIdentifiers;
+    const rdmaCtl = rdmaCtlData;
+    if (!edges || !ids || !rdmaCtl) return null;
+
+    const affectedConnections: Array<{
+      nodeId: string;
+      nodeName: string;
+      peerNodeId: string;
+      peerNodeName: string;
+      rdmaIface: string;
+    }> = [];
+
+    const isMacStudio = (node: (typeof data.nodes)[string] | undefined) =>
+      node?.system_info?.model_id === "Mac Studio";
+
+    for (const edge of edges) {
+      if (!edge.sourceRdmaIface && !edge.sinkRdmaIface) continue;
+
+      const sourceNode = data?.nodes?.[edge.source];
+      if (
+        isMacStudio(sourceNode) &&
+        edge.sourceRdmaIface === "rdma_en2" &&
+        rdmaCtl[edge.source]?.enabled
+      ) {
+        affectedConnections.push({
+          nodeId: edge.source,
+          nodeName:
+            sourceNode?.friendly_name || edge.source.slice(0, 8) + "...",
+          peerNodeId: edge.target,
+          peerNodeName:
+            data?.nodes?.[edge.target]?.friendly_name ||
+            edge.target.slice(0, 8) + "...",
+          rdmaIface: "en2",
+        });
+      }
+
+      const sinkNode = data?.nodes?.[edge.target];
+      if (
+        isMacStudio(sinkNode) &&
+        edge.sinkRdmaIface === "rdma_en2" &&
+        rdmaCtl[edge.target]?.enabled
+      ) {
+        affectedConnections.push({
+          nodeId: edge.target,
+          nodeName: sinkNode?.friendly_name || edge.target.slice(0, 8) + "...",
+          peerNodeId: edge.source,
+          peerNodeName:
+            sourceNode?.friendly_name || edge.source.slice(0, 8) + "...",
+          rdmaIface: "en2",
+        });
+      }
+    }
+
+    // Deduplicate by nodeId
+    const seen = new Set<string>();
+    const unique = affectedConnections.filter((c) => {
+      if (seen.has(c.nodeId)) return false;
+      seen.add(c.nodeId);
+      return true;
+    });
+
+    return unique.length > 0 ? unique : null;
+  });
+  let macStudioEn2Dismissed = $state(
+    loadWarningDismissed(RDMA_INCOMPATIBLE_PORT_DISMISSED_KEY),
+  );
+  function dismissMacStudioEn2() {
+    macStudioEn2Dismissed = true;
+    saveWarningDismissed(RDMA_INCOMPATIBLE_PORT_DISMISSED_KEY);
+  }
+
+  // Helper to get friendly node name from node ID
+  function getNodeName(nodeId: string): string {
+    const node = data?.nodes?.[nodeId];
+    return node?.friendly_name || nodeId.slice(0, 8) + "...";
+  }
+
+  // Helper to get the thunderbolt bridge service name from a loop (cycle in the API)
+  function getTbBridgeServiceName(cycle: string[]): string {
+    // Try to find service name from any node in the cycle
+    for (const nodeId of cycle) {
+      const nodeData = tbBridgeData?.[nodeId];
+      if (nodeData?.serviceName) {
+        return nodeData.serviceName;
+      }
+    }
+    return "Thunderbolt Bridge"; // Fallback if no service name found
+  }
+
+  // Copy to clipboard state and function
+  let copiedCommand = $state(false);
+  async function copyToClipboard(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedCommand = true;
+      setTimeout(() => {
+        copiedCommand = false;
+      }, 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+  }
+
+  // Warning icon SVG path (reused across warning snippets)
+  const warningIconPath =
+    "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z";
+  const infoIconPath =
+    "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z";
+
+  let mounted = $state(false);
+  let localNodeId = $state<string | null>(null);
+  let pendingFirefoxQuery = $state<string | null>(null); // ?q= param deferred until state loads
+
+  // ── Onboarding wizard state ──
+  const ONBOARDING_COMPLETE_KEY = "exo-onboarding-complete";
+  // 0 = not in onboarding, 6 = pick a model, 7 = getting it ready (download
+  // and load), 9 = chat. The numbers are those of the older, longer wizard.
+  let onboardingStep = $state(0);
+  let onboardingModelId = $state<string | null>(null); // model selected during onboarding
+  let onboardingFadingOut = $state(false); // true during fade-out transition
+  // Onboarding isn't complete, and the first cluster state decides whether to
+  // show it: a device that joins a cluster that already runs a model skips it
+  let onboardingDecisionPending = $state(false);
+  const showOnboarding = $derived(onboardingStep > 0);
+  const showOnboardingOverlay = $derived(
+    showOnboarding || onboardingFadingOut || onboardingDecisionPending,
+  );
+  // Shown on the model list after the user stopped getting a model ready
+  let onboardingNote = $state<string | null>(null);
+
+  // ── "How EXO works": optional cinematic SVG story, steps 1-4 ──
+  // Opened from onboarding and played over it; onboardingStep (and the
+  // tracking of a model getting ready) carries on underneath.
+  let explainerStep = $state(0); // 0 = closed
+  const SIMULATED_STUDIO_GB = 256; // simulated second Mac's memory
+  const onboardingCombinedGB = $derived(
+    userDeviceInfo.memoryGB + SIMULATED_STUDIO_GB,
+  );
+
+  // Models unlocked by adding the second device — one per base model, well-known preferred
+  const unlockedModels = $derived.by(() => {
+    if (models.length === 0) return [];
+    const singleGB = userDeviceInfo.memoryGB;
+    const combinedGB = onboardingCombinedGB;
+    const candidates = models
+      .filter((m) => {
+        const sizeGB = getModelSizeGB(m);
+        return sizeGB > singleGB && sizeGB <= combinedGB && m.family;
+      })
+      .sort((a, b) => getModelSizeGB(a) - getModelSizeGB(b));
+    // Deduplicate by base_model (or family as fallback) — keep smallest quant per base
+    const seen = new Set<string>();
+    const deduped: typeof candidates = [];
+    for (const m of candidates) {
+      const key = m.base_model || m.family || m.id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(m);
+    }
+    return deduped.slice(0, 3);
+  });
+
+  // User device info from topology — uses /node_id to find our own node
+  const userDeviceInfo = $derived.by(() => {
+    if (!data || Object.keys(data.nodes).length === 0) {
+      return { name: "MacBook Pro", memoryGB: 36, deviceType: "macbook pro" };
+    }
+    const ourNode = localNodeId ? data.nodes[localNodeId] : undefined;
+    const node = ourNode ?? Object.values(data.nodes)[0];
+    const totalMem =
+      node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
+    const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
+    const name = node.friendly_name || "Your Mac";
+    const modelId = (node.system_info?.model_id || "macbook pro").toLowerCase();
+    return { name, memoryGB: memGB || 36, deviceType: modelId };
+  });
+
+  let showContinueButton = $state(false);
+  let stepTitle = $state("");
+  let stepTransitioning = $state(false);
+
+  function openExplainer() {
+    showContinueButton = false;
+    explainerStep = 1;
+  }
+
+  // Leave the story: fade out, then show the onboarding step underneath
+  function closeExplainer() {
+    showContinueButton = false;
+    stepTransitioning = true;
+    setTimeout(() => {
+      explainerStep = 0;
+      stepTransitioning = false;
+    }, 350);
+  }
+
+  // Advance to the next step of the story, or leave it after the last
+  function advanceExplainer(target: number) {
+    showContinueButton = false;
+    if (target <= 4) {
+      // Steps 1-4 share a persistent SVG canvas — just set the step directly
+      explainerStep = target;
+    } else {
+      closeExplainer();
+    }
+  }
+
+  // Tweened animation values for the persistent SVG canvas
+  const device1X = tweened(350, { duration: 800, easing: cubicInOut });
+  const device2X = tweened(550, { duration: 800, easing: cubicInOut });
+  const device2Opacity = tweened(0, { duration: 600, easing: cubicOut });
+  const connectionOpacity = tweened(0, { duration: 500, easing: cubicOut });
+  const connectionIsRed = tweened(0, { duration: 500, easing: cubicOut }); // 0=gold, 1=red
+  const combinedLabelOpacity = tweened(0, { duration: 500, easing: cubicOut });
+  const modelBlockY = tweened(20, { duration: 700, easing: cubicInOut });
+  const modelBlockOpacity = tweened(0, { duration: 500, easing: cubicOut });
+  const modelSplitProgress = tweened(0, { duration: 800, easing: cubicInOut }); // 0=unified, 1=fully split
+  const disconnectXOpacity = tweened(0, { duration: 400, easing: cubicOut });
+  const device1Opacity = tweened(1, { duration: 600, easing: cubicOut });
+  const logoOpacity = tweened(1, { duration: 600, easing: cubicOut });
+  // Step 2 chip fade: 0→N where each chip fades in at its stagger offset
+  const chipPhase = tweened(0, { duration: 800, easing: cubicOut });
+  const deviceCountOpacity = tweened(0, { duration: 600, easing: cubicOut });
+  const topologyOpacity = tweened(1, { duration: 400, easing: cubicOut });
+  const titleOpacity = tweened(0, { duration: 500, easing: cubicOut });
+  const subtitleOpacity = tweened(0, { duration: 500, easing: cubicOut });
+
+  // ── Step 1: "Your cluster" — show real topology ──
+  $effect(() => {
+    if (explainerStep === 1) {
+      showContinueButton = false;
+      stepTitle = "";
+      // Reset all tweens to initial
+      device1X.set(350, { duration: 0 });
+      device1Opacity.set(0, { duration: 0 });
+      device2Opacity.set(0, { duration: 0 });
+      connectionOpacity.set(0, { duration: 0 });
+      connectionIsRed.set(0, { duration: 0 });
+      combinedLabelOpacity.set(0, { duration: 0 });
+      modelBlockOpacity.set(0, { duration: 0 });
+      modelSplitProgress.set(0, { duration: 0 });
+      disconnectXOpacity.set(0, { duration: 0 });
+      logoOpacity.set(1, { duration: 0 });
+      titleOpacity.set(0, { duration: 0 });
+      subtitleOpacity.set(0, { duration: 0 });
+      chipPhase.set(0, { duration: 0 });
+      deviceCountOpacity.set(0, { duration: 0 });
+      topologyOpacity.set(1, { duration: 0 });
+
+      const t1 = setTimeout(() => {
+        titleOpacity.set(1);
+      }, 300);
+      const t2 = setTimeout(() => {
+        deviceCountOpacity.set(1);
+      }, 800);
+      const t3 = setTimeout(() => {
+        showContinueButton = true;
+      }, 1200);
+
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+      };
+    }
+  });
+
+  // ── Step 2: "Add devices to run larger models" — cross-fade topology out, device pair animates in ──
+  $effect(() => {
+    if (explainerStep === 2) {
+      showContinueButton = false;
+
+      // Cross-fade: fade out real topology
+      topologyOpacity.set(0);
+
+      // Immediately transition out step 1 elements
+      logoOpacity.set(0);
+      deviceCountOpacity.set(0);
+      // Smoothly crossfade the title: fade old out, update text, fade new in
+      titleOpacity.set(0, { duration: 300 });
+      subtitleOpacity.set(0, { duration: 0 });
+
+      // Delay all step 2 animations by 400ms to let topology fade out
+      const DELAY = 400;
+
+      const t0 = setTimeout(() => {
+        stepTitle = "Add devices to run larger models";
+        titleOpacity.set(1, { duration: 400 });
+      }, DELAY + 300);
+
+      const t1 = setTimeout(() => {
+        device1Opacity.set(1, { duration: 0 });
+        device1X.set(220);
+        device2X.set(480, { duration: 0 });
+        device2Opacity.set(0, { duration: 0 });
+      }, DELAY + 200);
+      const t2 = setTimeout(() => {
+        device2Opacity.set(1);
+        device2X.set(480);
+      }, DELAY + 700);
+      const t3 = setTimeout(() => {
+        connectionOpacity.set(1);
+      }, DELAY + 1200);
+      const t4 = setTimeout(() => {
+        combinedLabelOpacity.set(1);
+      }, DELAY + 1600);
+      // Staggered chip fade-in (each chip offsets by 0.6 in chipPhase)
+      const t5 = setTimeout(() => {
+        chipPhase.set(3, { duration: 1800 });
+      }, DELAY + 1800);
+      const t6 = setTimeout(() => {
+        showContinueButton = true;
+      }, DELAY + 3200);
+
+      return () => {
+        clearTimeout(t0);
+        clearTimeout(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+        clearTimeout(t4);
+        clearTimeout(t5);
+        clearTimeout(t6);
+      };
+    }
+  });
+
+  // ── Step 3: "EXO splits the model" — model block appears, splits ──
+  $effect(() => {
+    if (explainerStep === 3) {
+      showContinueButton = false;
+      // Gently fade out the unlock chips
+      chipPhase.set(0, { duration: 600 });
+
+      // Crossfade title
+      titleOpacity.set(0, { duration: 250 });
+      subtitleOpacity.set(0, { duration: 250 });
+      setTimeout(() => {
+        stepTitle = "EXO splits models across devices";
+        titleOpacity.set(1, { duration: 400 });
+        subtitleOpacity.set(1, { duration: 400 });
+      }, 250);
+
+      // Wait for chips to fade before showing model block
+      const t1 = setTimeout(() => {
+        modelBlockOpacity.set(1);
+        modelBlockY.set(50);
+      }, 600);
+      const t2 = setTimeout(() => {
+        modelSplitProgress.set(1);
+      }, 1500);
+      const t3 = setTimeout(() => {
+        showContinueButton = true;
+      }, 2300);
+
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+      };
+    }
+  });
+
+  // ── Step 4: "A device disconnects... start it again on the remaining devices" ──
+  $effect(() => {
+    if (explainerStep === 4) {
+      showContinueButton = false;
+
+      // Crossfade title
+      titleOpacity.set(0, { duration: 250 });
+      subtitleOpacity.set(0, { duration: 250 });
+      setTimeout(() => {
+        stepTitle = "When a device disconnects...";
+        titleOpacity.set(1, { duration: 400 });
+        subtitleOpacity.set(1, { duration: 400 });
+      }, 250);
+
+      // Phase 1: Disconnect
+      const t1 = setTimeout(() => {
+        connectionIsRed.set(1);
+      }, 400);
+      const t2 = setTimeout(() => {
+        disconnectXOpacity.set(1);
+      }, 800);
+      const t3 = setTimeout(() => {
+        device2Opacity.set(0);
+        connectionOpacity.set(0);
+        disconnectXOpacity.set(0);
+        combinedLabelOpacity.set(0);
+        modelBlockOpacity.set(0.25); // The model stops with the device
+      }, 1600);
+
+      // Phase 2: Start again on what is left — crossfade title + subtitle
+      const t4 = setTimeout(() => {
+        titleOpacity.set(0, { duration: 250 });
+        subtitleOpacity.set(0, { duration: 250 });
+      }, 2550);
+      const t4b = setTimeout(() => {
+        stepTitle = "Start it again on the remaining devices";
+        titleOpacity.set(1, { duration: 400 });
+        subtitleOpacity.set(1, { duration: 400 });
+      }, 2800);
+      const t5 = setTimeout(() => {
+        device1X.set(350);
+        device2X.set(350);
+      }, 3100);
+      const t6 = setTimeout(() => {
+        modelSplitProgress.set(0);
+        modelBlockY.set(20); // Lift up while merging
+        modelBlockOpacity.set(1); // Started again on the remaining device
+        connectionIsRed.set(0);
+      }, 3700);
+      const t7 = setTimeout(() => {
+        modelBlockY.set(125); // Settle back down just above the device
+      }, 4800);
+      const t8 = setTimeout(() => {
+        closeExplainer();
+      }, 6200);
+
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+        clearTimeout(t3);
+        clearTimeout(t4);
+        clearTimeout(t4b);
+        clearTimeout(t5);
+        clearTimeout(t6);
+        clearTimeout(t7);
+        clearTimeout(t8);
+      };
+    }
+  });
+
+  // The model onboarding recommends, listed first: small and quick to
+  // download, so the first chat is minutes away. Llama 3.2 3B when it fits,
+  // otherwise the smallest text model that does.
+  const PINNED_ONBOARDING_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit";
+  const onboardingRecommendedModel = $derived.by(() => {
+    const fitting = models.filter(
+      (m) =>
+        hasEnoughMemory(m) &&
+        getModelSizeGB(m) > 0 &&
+        (!m.tasks || m.tasks.includes("TextGeneration")),
+    );
+    return (
+      fitting.find((m) => m.id === PINNED_ONBOARDING_MODEL) ??
+      [...fitting].sort((a, b) => getModelSizeGB(a) - getModelSizeGB(b))[0] ??
+      null
+    );
+  });
+
+  // Bigger models after it, smallest first: four that fit, spread from small
+  // to the biggest, one quantization (the smallest) per base model
+  const ONBOARDING_OTHER_MODEL_COUNT = 4;
+  const onboardingOtherModels = $derived.by(() => {
+    const recommendedId = onboardingRecommendedModel?.id;
+    const seenBaseModels = new Set<string>();
+    const candidates = models
+      .filter(
+        (m) =>
+          m.id !== recommendedId && hasEnoughMemory(m) && getModelSizeGB(m) > 0,
+      )
+      .sort((a, b) => getModelSizeGB(a) - getModelSizeGB(b))
+      .filter((m) => {
+        const key = m.base_model || m.id;
+        if (seenBaseModels.has(key)) return false;
+        seenBaseModels.add(key);
+        return true;
+      });
+    if (candidates.length <= ONBOARDING_OTHER_MODEL_COUNT) return candidates;
+    const picked = new Set<number>();
+    for (let i = 1; i <= ONBOARDING_OTHER_MODEL_COUNT; i++) {
+      picked.add(
+        Math.round(
+          (i / ONBOARDING_OTHER_MODEL_COUNT) * (candidates.length - 1),
+        ),
+      );
+    }
+    return [...picked].sort((a, b) => a - b).map((i) => candidates[i]);
+  });
+
+  // A rough download time, assuming a typical 100 Mbit/s connection
+  const ASSUMED_DOWNLOAD_BYTES_PER_SECOND = 100_000_000 / 8;
+
+  // "less than a minute", "about 4 min", "about 2.5 h"
+  function formatRoughDuration(ms: number): string {
+    const minutes = ms / 60_000;
+    if (minutes < 1) return "less than a minute";
+    if (minutes < 60) return `about ${Math.round(minutes)} min`;
+    const hours = minutes / 60;
+    return `about ${hours < 10 ? Number(hours.toFixed(1)) : Math.round(hours)} h`;
+  }
+
+  // Size and download time for the onboarding model list
+  function describeOnboardingDownload(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): string {
+    const sizeGB = getModelSizeGB(model);
+    const size = `${sizeGB >= 10 ? Math.round(sizeGB) : sizeGB.toFixed(1)} GB`;
+    if (getNodesWithModelDownloaded(downloadsData, model.id).length > 0) {
+      return `${size} · downloaded`;
+    }
+    const seconds =
+      (sizeGB * 1024 * 1024 * 1024) / ASSUMED_DOWNLOAD_BYTES_PER_SECOND;
+    return `${size} · ${formatRoughDuration(seconds * 1000)} to download`;
+  }
+
+  // The model onboarding started is ready: go to the chat. Runner status is
+  // the source of truth (missing download data can look like "ready"), and
+  // only the model started here counts.
+  $effect(() => {
+    if (onboardingStep !== 7 || !onboardingModelId) return;
+    for (const [, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== onboardingModelId) continue;
+      const runnerStatus = deriveInstanceStatus(inst);
+      if (
+        runnerStatus.statusText === "READY" ||
+        runnerStatus.statusText === "LOADED" ||
+        runnerStatus.statusText === "RUNNING"
+      ) {
+        onboardingStep = 9;
+        return;
+      }
+    }
+  });
+
+  function completeOnboarding() {
+    // Trigger fade-out, then fully remove overlay
+    onboardingFadingOut = true;
+    onboardingStep = 0;
+    try {
+      localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    } catch {
+      // ignore
+    }
+    // Persist to server (~/.exo)
+    fetch("/onboarding", { method: "POST" }).catch(() => {});
+    // Remove overlay after fade-out transition completes
+    setTimeout(() => {
+      onboardingFadingOut = false;
+    }, 500);
+  }
+
+  // Auto-complete onboarding when user sends a message from step 9
+  $effect(() => {
+    if (onboardingStep === 9 && chatStarted) {
+      completeOnboarding();
+    }
+  });
+
+  let onboardingError = $state<string | null>(null);
+  // The instance launched from onboarding, so a failure can send the user back
+  let onboardingInstanceId = $state<string | null>(null);
+  let onboardingInstanceSeen = $state(false);
+  // Shown while the worker retries a failed runner (it retries with backoff
+  // and removes the instance after EXO_MAX_INSTANCE_RETRIES attempts)
+  let onboardingRetryNote = $state<string | null>(null);
+  let onboardingLastFailure: string | null = null;
+  let onboardingFailedSince: number | null = null;
+  // Launched but never appeared in time; removed if it shows up later
+  let abandonedOnboardingInstanceId = $state<string | null>(null);
+  const ONBOARDING_LAUNCH_TIMEOUT_MS = 30_000;
+  // Safety net: normally the worker removes the instance first (its retries
+  // take ~25-30 s when every attempt fails)
+  const ONBOARDING_FAILED_GIVE_UP_MS = 45_000;
+
+  function getOnboardingModelName(): string {
+    return onboardingModelId ? getModelDisplayName(onboardingModelId) : "Model";
+  }
+
+  function resetOnboardingLaunchTracking() {
+    onboardingInstanceId = null;
+    onboardingInstanceSeen = false;
+    onboardingRetryNote = null;
+    onboardingLastFailure = null;
+    onboardingFailedSince = null;
+  }
+
+  // Return to the model list with the reason instead of waiting forever
+  function failOnboardingLaunch(message: string, removeInstance: boolean) {
+    const instanceId = onboardingInstanceId;
+    resetOnboardingLaunchTracking();
+    onboardingError = message;
+    onboardingStep = 6;
+    // Don't leave behind an instance that can't start
+    if (removeInstance && instanceId && instanceData[instanceId]) {
+      void requestInstanceDeletion(instanceId);
+    }
+  }
+
+  $effect(() => {
+    if (onboardingStep !== 7) return;
+    if (!onboardingInstanceId) return;
+    const inst = instanceData[onboardingInstanceId];
+    if (!inst) {
+      // Gone after being seen: the worker gave up after retrying (the last
+      // failure is only kept while it was failing), or e.g. a device left
+      if (onboardingInstanceSeen) {
+        failOnboardingLaunch(
+          onboardingLastFailure ??
+            `${getOnboardingModelName()} stopped before it was ready. Try again.`,
+          false,
+        );
+      }
+      return;
+    }
+    onboardingInstanceSeen = true;
+    const status = getInstanceDownloadStatus(onboardingInstanceId, inst);
+    if (!status.isFailed) {
+      // Not failing (any more), e.g. the worker's retry is loading: drop the
+      // note, and don't blame a later disappearance on the old failure
+      onboardingFailedSince = null;
+      onboardingRetryNote = null;
+      onboardingLastFailure = null;
+      return;
+    }
+    if (deriveInstanceStatus(inst).statusText !== "FAILED") {
+      // Failed downloads aren't retried by the worker
+      failOnboardingLaunch(
+        `${getOnboardingModelName()} failed to download: ${status.errorMessage ?? "unknown error"}`,
+        true,
+      );
+      return;
+    }
+    // The runner failed; the worker will retry it
+    const reason = status.errorMessage
+      ? summarizeFailureReason(status.errorMessage)
+      : "the runner stopped unexpectedly";
+    onboardingLastFailure = `${getOnboardingModelName()} failed to start: ${reason}`;
+    onboardingRetryNote = `${onboardingLastFailure}. Retrying…`;
+    onboardingFailedSince ??= Date.now();
+    if (Date.now() - onboardingFailedSince >= ONBOARDING_FAILED_GIVE_UP_MS) {
+      failOnboardingLaunch(onboardingLastFailure, true);
+    }
+  });
+
+  $effect(() => {
+    const instances = instanceData;
+    const abandonedId = abandonedOnboardingInstanceId;
+    if (abandonedId && instances[abandonedId]) {
+      abandonedOnboardingInstanceId = null;
+      void requestInstanceDeletion(abandonedId);
+    }
+  });
+
+  // Bumped when the user leaves a model that is being started, so a launch
+  // still in flight knows it was abandoned
+  let onboardingLaunchGeneration = 0;
+
+  // "Pick a different model" while one is getting ready: stop it. Its
+  // download stops too (the master pauses downloads that no model needs),
+  // so a large one doesn't carry on unnoticed. What was downloaded stays on
+  // disk, and the Downloads page can resume or delete it; say so.
+  async function pickDifferentOnboardingModel() {
+    const instanceId = onboardingInstanceId;
+    const modelId = onboardingModelId;
+    onboardingLaunchGeneration++;
+    resetOnboardingLaunchTracking();
+    onboardingError = null;
+    onboardingNote = null;
+    onboardingStep = 6;
+    if (!modelId) return;
+    const partlyDownloaded = getModelDownloadStatus(modelId).perNode.some(
+      (node) => node.status === "downloading" || node.status === "partial",
+    );
+    if (instanceId && instanceData[instanceId]) {
+      await requestInstanceDeletion(instanceId);
+    }
+    if (partlyDownloaded && onboardingStep === 6) {
+      onboardingNote = `Stopped ${getModelDisplayName(modelId)}. Its download is paused: resume or delete it on the Downloads page.`;
+    }
+  }
+
+  async function onboardingLaunchModel(modelId: string) {
+    const generation = ++onboardingLaunchGeneration;
+    onboardingModelId = modelId;
+    onboardingError = null;
+    onboardingNote = null;
+    resetOnboardingLaunchTracking();
+    selectPreviewModel(modelId);
+    onboardingStep = 7;
+    // Launch via standard placement API (same as main dashboard)
+    // Single-node: force Pipeline/Ring regardless of persisted defaults
+    const nodeCount = topologyData()
+      ? Object.keys(topologyData()!.nodes).length
+      : 1;
+    const sharding = nodeCount <= 1 ? "Pipeline" : selectedSharding;
+    const instanceType = nodeCount <= 1 ? "MlxRing" : selectedInstanceType;
+    try {
+      const placementResponse = await fetch(
+        `/instance/placement?model_id=${encodeURIComponent(modelId)}&sharding=${sharding}&instance_meta=${instanceType}&min_nodes=1`,
+      );
+      if (!placementResponse.ok) {
+        const errorText = await readApiErrorMessage(placementResponse);
+        onboardingError = `Failed to get placement: ${errorText}`;
+        onboardingStep = 6;
+        return;
+      }
+      const instanceData = await placementResponse.json();
+      const response = await fetch("/instance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance: instanceData }),
+      });
+      if (!response.ok) {
+        const errorText = await readApiErrorMessage(response);
+        onboardingError = `Couldn't start ${getModelDisplayName(modelId)}: ${errorText}`;
+        onboardingStep = 6;
+        return;
+      }
+      const [, placed] = getTagged(instanceData);
+      const launchedId =
+        (placed as { instanceId?: string } | null)?.instanceId ?? null;
+      if (generation !== onboardingLaunchGeneration) {
+        // The user picked a different model while this one was being placed
+        if (launchedId) abandonedOnboardingInstanceId = launchedId;
+        return;
+      }
+      onboardingInstanceId = launchedId;
+      if (launchedId) {
+        setTimeout(() => {
+          if (
+            onboardingStep === 7 &&
+            onboardingInstanceId === launchedId &&
+            !onboardingInstanceSeen
+          ) {
+            abandonedOnboardingInstanceId = launchedId;
+            failOnboardingLaunch(
+              `${getOnboardingModelName()} didn't start after 30 seconds. Try again or pick another model.`,
+              false,
+            );
+          }
+        }, ONBOARDING_LAUNCH_TIMEOUT_MS);
+      }
+      setSelectedChatModel(modelId);
+      recordRecentLaunch(modelId);
+    } catch (error) {
+      onboardingError = `Network error: ${error}`;
+      onboardingStep = 6;
+    }
+  }
+
+  // Helper to get onboarding download progress
+  const onboardingDownloadProgress = $derived.by(() => {
+    if (instanceCount === 0) return null;
+    for (const [id, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== onboardingModelId) continue;
+      const status = getInstanceDownloadStatus(id, inst);
+      if (status.isDownloading && status.progress) {
+        return status.progress;
+      }
+    }
+    return null;
+  });
+
+  // Helper to get onboarding model loading progress (layers loaded)
+  const onboardingLoadProgress = $derived.by(() => {
+    if (instanceCount === 0 || !onboardingModelId) return null;
+    let layersLoaded = 0,
+      totalLayers = 0;
+    for (const [, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== onboardingModelId) continue;
+      const status = deriveInstanceStatus(inst);
+      if (
+        status.statusText === "LOADING" &&
+        status.totalLayers &&
+        status.totalLayers > 0
+      ) {
+        layersLoaded += status.layersLoaded ?? 0;
+        totalLayers += status.totalLayers;
+      }
+    }
+    if (totalLayers === 0) return null;
+    return {
+      layersLoaded,
+      totalLayers,
+      percentage: (layersLoaded / totalLayers) * 100,
+    };
+  });
+
+  // "Getting <model> ready": the download, then loading into memory, as one
+  // progress bar and one line of plain status
+  const onboardingReadiness = $derived.by(
+    (): { percentage: number | null; status: string } => {
+      const download = onboardingDownloadProgress;
+      if (download) {
+        // The first seconds of a download give wild estimates
+        const timeLeft =
+          download.etaMs > 0 && download.percentage >= 1
+            ? ` · ${formatRoughDuration(download.etaMs)} left`
+            : "";
+        const amount = `${formatBytes(download.downloadedBytes, 1)} of ${formatBytes(download.totalBytes, 1)}`;
+        return {
+          percentage: download.percentage,
+          // Stalled (e.g. Hugging Face unreachable): say so, as the model
+          // card and the Downloads page do
+          status: download.stalled
+            ? `${download.stalledText ?? "Stalled"} · ${amount}`
+            : `Downloading · ${amount}${timeLeft}`,
+        };
+      }
+      const load = onboardingLoadProgress;
+      if (load) {
+        return {
+          percentage: load.percentage,
+          status: `Loading into memory · ${load.layersLoaded} of ${load.totalLayers} layers`,
+        };
+      }
+      // Loaded, running a first short generation before it's ready
+      const warmingUp = Object.values(instanceData).some(
+        (inst) =>
+          getInstanceModelId(inst) === onboardingModelId &&
+          deriveInstanceStatus(inst).statusText === "WARMING UP",
+      );
+      return {
+        percentage: null,
+        status: warmingUp ? "Almost ready…" : "Starting…",
+      };
+    },
+  );
+
+  // Instance launch state
+  let models = $state<
+    Array<{
+      id: string;
+      name?: string;
+      storage_size_megabytes?: number;
+      tasks?: string[];
+      hugging_face_id?: string;
+      is_custom?: boolean;
+      family?: string;
+      quantization?: string;
+      base_model?: string;
+      capabilities?: string[];
+    }>
+  >([]);
+  type ModelMemoryFitStatus =
+    | "fits_now"
+    // Fits in memory, but its devices haven't the disk space to download it
+    | "no_disk_space"
+    | "fits_cluster_capacity"
+    | "too_large";
+
+  // Model tasks lookup for ChatForm - maps both short IDs and full HuggingFace IDs
+  const modelTasks = $derived(() => {
+    const tasks: Record<string, string[]> = {};
+    for (const model of models) {
+      if (model.tasks && model.tasks.length > 0) {
+        // Map by short ID
+        tasks[model.id] = model.tasks;
+        // Also map by hugging_face_id from the API response
+        if (model.hugging_face_id) {
+          tasks[model.hugging_face_id] = model.tasks;
+        }
+      }
+    }
+    return tasks;
+  });
+
+  const modelCapabilities = $derived(() => {
+    const caps: Record<string, string[]> = {};
+    for (const model of models) {
+      if (model.capabilities && model.capabilities.length > 0) {
+        caps[model.id] = model.capabilities;
+        if (model.hugging_face_id) {
+          caps[model.hugging_face_id] = model.capabilities;
+        }
+      }
+    }
+    return caps;
+  });
+
+  // Helper to check if a model supports image generation
+  function modelSupportsImageGeneration(modelId: string): boolean {
+    const model = models.find(
+      (m) => m.id === modelId || m.hugging_face_id === modelId,
+    );
+    if (!model?.tasks) return false;
+    return (
+      model.tasks.includes("TextToImage") ||
+      model.tasks.includes("ImageToImage")
+    );
+  }
+
+  // Helper to check if a model supports image editing
+  function modelSupportsImageEditing(modelId: string): boolean {
+    const model = models.find(
+      (m) => m.id === modelId || m.hugging_face_id === modelId,
+    );
+    if (!model?.tasks) return false;
+    return model.tasks.includes("ImageToImage");
+  }
+
+  // Route a message to the correct endpoint based on model capabilities.
+  // Image models go to generateImage/editImage; text models go to sendMessage.
+  function routeMessage(
+    content: string,
+    files?: {
+      id: string;
+      name: string;
+      type: string;
+      textContent?: string;
+      preview?: string;
+    }[],
+  ) {
+    const model = selectedChatModel();
+    if (!model) {
+      sendMessage(content, files, thinkingEnabled());
+      return;
+    }
+
+    const currentEditImage = editingImage();
+
+    // Image editing mode (explicit edit or attached image with ImageToImage model)
+    if (currentEditImage && content && modelSupportsImageEditing(model)) {
+      editImage(content, currentEditImage.imageDataUrl);
+      return;
+    }
+    if (
+      modelSupportsImageEditing(model) &&
+      files?.length &&
+      files[0].preview &&
+      content
+    ) {
+      editImage(content, files[0].preview);
+      return;
+    }
+
+    // Text-to-image generation
+    if (modelSupportsImageGeneration(model) && content) {
+      generateImage(content);
+      return;
+    }
+
+    // Default: text chat
+    sendMessage(content, files, thinkingEnabled());
+  }
+
+  let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
+  type InstanceMeta = "MlxRing" | "MlxJaccl";
+
+  // Launch defaults persistence
+  const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
+  interface LaunchDefaults {
+    modelId: string | null;
+    sharding: "Pipeline" | "Tensor";
+    instanceType: InstanceMeta;
+    minNodes: number;
+  }
+
+  function saveLaunchDefaults(): void {
+    const defaults: LaunchDefaults = {
+      modelId: selectedPreviewModelId(),
+      sharding: selectedSharding,
+      instanceType: selectedInstanceType,
+      minNodes: selectedMinNodes,
+    };
+    try {
+      localStorage.setItem(LAUNCH_DEFAULTS_KEY, JSON.stringify(defaults));
+    } catch (e) {
+      console.warn("Failed to save launch defaults:", e);
+    }
+  }
+
+  function loadLaunchDefaults(): LaunchDefaults | null {
+    try {
+      const stored = localStorage.getItem(LAUNCH_DEFAULTS_KEY);
+      if (!stored) return null;
+      return JSON.parse(stored) as LaunchDefaults;
+    } catch (e) {
+      console.warn("Failed to load launch defaults:", e);
+      return null;
+    }
+  }
+
+  function applyLaunchDefaults(
+    availableModels: Array<{ id: string }>,
+    maxNodes: number,
+  ): void {
+    const defaults = loadLaunchDefaults();
+    if (!defaults) return;
+
+    // Apply sharding and instance type unconditionally
+    selectedSharding = defaults.sharding;
+    selectedInstanceType =
+      defaults.instanceType === "MlxRing" ? "MlxRing" : "MlxJaccl";
+
+    // Apply minNodes if valid (between 1 and maxNodes)
+    if (
+      defaults.minNodes &&
+      defaults.minNodes >= 1 &&
+      defaults.minNodes <= maxNodes
+    ) {
+      selectedMinNodes = defaults.minNodes;
+    }
+
+    // Only apply model if it exists in the available models
+    if (
+      defaults.modelId &&
+      availableModels.some((m) => m.id === defaults.modelId)
+    ) {
+      selectPreviewModel(defaults.modelId);
+      setSelectedChatModel(defaults.modelId);
+    }
+  }
+
+  let selectedInstanceType = $state<InstanceMeta>("MlxRing");
+  let selectedMinNodes = $state<number>(1);
+  let minNodesInitialized = $state(false);
+  let launchingModelId = $state<string | null>(null);
+  let instanceDownloadExpandedNodes = $state<Set<string>>(new Set());
+
+  // Model picker modal state
+  let isModelPickerOpen = $state(false);
+
+  // Advanced options toggle (hides technical jargon for new users)
+  let showAdvancedOptions = $state(false);
+
+  // Favorites state (reactive)
+  const favoritesSet = $derived(getFavoritesSet());
+
+  // Recent models state (reactive)
+  const recentModelIds = $derived(getRecentModelIds());
+  const showRecentsTab = $derived(hasRecents());
+
+  // Slider dragging state
+  let isDraggingSlider = $state(false);
+  let sliderTrackElement: HTMLDivElement | null = $state(null);
+
+  // Instances container ref for scrolling
+  let instancesContainerRef: HTMLDivElement | null = $state(null);
+  // Chat scroll container ref for precise scroll behavior
+  let chatScrollRef: HTMLDivElement | null = $state(null);
+
+  // Instance hover state for highlighting nodes in topology
+  let hoveredInstanceId = $state<string | null>(null);
+
+  // Preview card hover state for highlighting nodes in topology
+  let hoveredPreviewNodes = $state<Set<string>>(new Set());
+
+  // Computed: Check if filter is active (from store)
+  const isFilterActive = $derived(() => nodeFilter.size > 0);
+
+  // Helper to unwrap tagged instance for hover highlighting
+  function unwrapInstanceNodes(instanceWrapped: unknown): Set<string> {
+    if (!instanceWrapped || typeof instanceWrapped !== "object")
+      return new Set();
+    const keys = Object.keys(instanceWrapped as Record<string, unknown>);
+    if (keys.length !== 1) return new Set();
+    const instance = (instanceWrapped as Record<string, unknown>)[keys[0]];
+    if (!instance || typeof instance !== "object") return new Set();
+    const inst = instance as {
+      shardAssignments?: { nodeToRunner?: Record<string, string> };
+    };
+    if (!inst.shardAssignments?.nodeToRunner) return new Set();
+    return new Set(Object.keys(inst.shardAssignments.nodeToRunner));
+  }
+
+  function toggleInstanceDownloadDetails(nodeId: string): void {
+    const next = new Set(instanceDownloadExpandedNodes);
+    if (next.has(nodeId)) {
+      next.delete(nodeId);
+    } else {
+      next.add(nodeId);
+    }
+    instanceDownloadExpandedNodes = next;
+  }
+
+  // Compute highlighted nodes from hovered instance or hovered preview
+  const highlightedNodes = $derived(() => {
+    // First check instance hover
+    if (hoveredInstanceId) {
+      const instanceWrapped = instanceData[hoveredInstanceId];
+      return unwrapInstanceNodes(instanceWrapped);
+    }
+    // Then check preview hover
+    if (hoveredPreviewNodes.size > 0) {
+      return hoveredPreviewNodes;
+    }
+    return new Set<string>();
+  });
+
+  // Helper to estimate memory from model ID (mirrors ModelCard logic)
+  // Uses regex with word boundaries to avoid false matches like '4bit' matching '4b'
+  function estimateMemoryGB(modelId: string, modelName?: string): number {
+    // Check both ID and name for quantization info
+    const combined = `${modelId} ${modelName || ""}`.toLowerCase();
+
+    // Detect quantization level - affects memory by roughly 2x between levels
+    const is4bit =
+      combined.includes("4bit") ||
+      combined.includes("4-bit") ||
+      combined.includes(":4bit");
+    const is8bit =
+      combined.includes("8bit") ||
+      combined.includes("8-bit") ||
+      combined.includes(":8bit");
+    // 4-bit = 0.5 bytes/param, 8-bit = 1 byte/param, fp16 = 2 bytes/param
+    const quantMultiplier = is4bit ? 0.5 : is8bit ? 1 : 2;
+    const id = modelId.toLowerCase();
+
+    // Known large models that don't follow the standard naming pattern
+    // DeepSeek V3 has 685B parameters
+    if (id.includes("deepseek-v3")) {
+      return Math.round(685 * quantMultiplier);
+    }
+    // DeepSeek V2 has 236B parameters
+    if (id.includes("deepseek-v2")) {
+      return Math.round(236 * quantMultiplier);
+    }
+    // Llama 4 Scout/Maverick are large models
+    if (id.includes("llama-4")) {
+      return Math.round(400 * quantMultiplier);
+    }
+
+    // Match parameter counts with word boundaries (e.g., "70b" but not "4bit")
+    const paramMatch = id.match(/(\d+(?:\.\d+)?)\s*b(?![a-z])/i);
+    if (paramMatch) {
+      const params = parseFloat(paramMatch[1]);
+      return Math.max(4, Math.round(params * quantMultiplier));
+    }
+
+    // Fallback patterns for explicit size markers (assume fp16 baseline, adjust for quant)
+    if (id.includes("405b") || id.includes("400b"))
+      return Math.round(405 * quantMultiplier);
+    if (id.includes("180b")) return Math.round(180 * quantMultiplier);
+    if (id.includes("141b") || id.includes("140b"))
+      return Math.round(140 * quantMultiplier);
+    if (id.includes("123b") || id.includes("120b"))
+      return Math.round(123 * quantMultiplier);
+    if (id.includes("72b") || id.includes("70b"))
+      return Math.round(70 * quantMultiplier);
+    if (id.includes("67b") || id.includes("65b"))
+      return Math.round(65 * quantMultiplier);
+    if (
+      id.includes("35b") ||
+      id.includes("34b") ||
+      id.includes("32b") ||
+      id.includes("30b")
+    )
+      return Math.round(32 * quantMultiplier);
+    if (id.includes("27b") || id.includes("26b") || id.includes("22b"))
+      return Math.round(24 * quantMultiplier);
+    if (id.includes("14b") || id.includes("13b") || id.includes("15b"))
+      return Math.round(14 * quantMultiplier);
+    if (id.includes("8b") || id.includes("9b") || id.includes("7b"))
+      return Math.round(8 * quantMultiplier);
+    if (id.includes("3b") || id.includes("3.8b"))
+      return Math.round(4 * quantMultiplier);
+    if (
+      id.includes("2b") ||
+      id.includes("1b") ||
+      id.includes("1.5b") ||
+      id.includes("0.5b")
+    )
+      return Math.round(2 * quantMultiplier);
+    return 16; // Default fallback
+  }
+
+  // Helper to estimate performance from model ID
+  function estimatePerformance(modelId: string): { ttft: number; tps: number } {
+    const id = modelId.toLowerCase();
+    if (id.includes("405b") || id.includes("400b"))
+      return { ttft: 8000, tps: 3 };
+    if (id.includes("180b")) return { ttft: 4000, tps: 5 };
+    if (id.includes("141b") || id.includes("140b"))
+      return { ttft: 3500, tps: 6 };
+    if (id.includes("123b") || id.includes("120b"))
+      return { ttft: 3000, tps: 7 };
+    if (id.includes("72b") || id.includes("70b"))
+      return { ttft: 1800, tps: 12 };
+    if (id.includes("67b") || id.includes("65b"))
+      return { ttft: 1600, tps: 14 };
+    if (
+      id.includes("35b") ||
+      id.includes("34b") ||
+      id.includes("32b") ||
+      id.includes("30b")
+    )
+      return { ttft: 900, tps: 22 };
+    if (id.includes("27b") || id.includes("26b") || id.includes("22b"))
+      return { ttft: 700, tps: 28 };
+    if (id.includes("14b") || id.includes("13b") || id.includes("15b"))
+      return { ttft: 400, tps: 45 };
+    if (id.includes("8b") || id.includes("9b") || id.includes("7b"))
+      return { ttft: 200, tps: 65 };
+    if (id.includes("4b") || id.includes("3b") || id.includes("3.8b"))
+      return { ttft: 100, tps: 95 };
+    if (
+      id.includes("2b") ||
+      id.includes("1b") ||
+      id.includes("1.5b") ||
+      id.includes("0.5b")
+    )
+      return { ttft: 50, tps: 150 };
+    return { ttft: 300, tps: 50 };
+  }
+
+  const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
+    selectedInstanceType === "MlxRing"
+      ? runtime === "MlxRing"
+      : runtime === "MlxJaccl";
+
+  // Helper to check if a model can be launched (has valid placement with >= minNodes)
+  function canModelFit(modelId: string): boolean {
+    // Find previews matching the model, sharding, and instance type
+    const matchingPreviews = previewsData.filter(
+      (p: PlacementPreview) =>
+        p.model_id === modelId &&
+        p.sharding === selectedSharding &&
+        matchesSelectedRuntime(p.instance_meta) &&
+        p.error === null &&
+        p.memory_delta_by_node !== null,
+    );
+
+    // Check if any preview has node count >= selectedMinNodes
+    return matchingPreviews.some(
+      (p: PlacementPreview) => getPreviewNodeCount(p) >= selectedMinNodes,
+    );
+  }
+
+  // What a connection type is called everywhere: the Connection options
+  // under Advanced Options, the start cards and the running-model cards
+  const RUNTIME_LABELS: Record<InstanceMeta, string> = {
+    MlxRing: "Standard (TCP/IP)",
+    MlxJaccl: "RDMA over Thunderbolt",
+  };
+
+  // Plain-language version of a placement error reported by the backend.
+  // Matches the ValueError messages raised by place_instance in
+  // src/exo/master/placement.py; anything else is shown as-is.
+  function describePlacementError(
+    error: string,
+    modelId: string,
+    onSelectedDevices = false,
+  ): string {
+    if (
+      error.startsWith("Not enough memory") ||
+      error.startsWith("No cycles found with sufficient memory")
+    ) {
+      const model = models.find((m) => m.id === modelId);
+      const sizeGB = model ? getModelSizeGB(model) : 0;
+      const where = onSelectedDevices
+        ? "on the selected devices"
+        : "on your devices";
+      return sizeGB > 0
+        ? `Not enough free memory ${where} (needs ${Math.ceil(sizeGB)} GB)`
+        : `Not enough free memory ${where}`;
+    }
+    if (error.startsWith("Requested RDMA")) {
+      return "RDMA needs devices connected over Thunderbolt 5 with RDMA enabled";
+    }
+    if (error.startsWith("Requested Tensor sharding but this model does not")) {
+      return "This model doesn't support Tensor sharding";
+    }
+    return error;
+  }
+
+  // Why none of these previews can launch. Prefers the Pipeline · TCP/IP
+  // error, since that is the least restrictive combination.
+  function getPlacementFailureReason(
+    previews: PlacementPreview[],
+    modelId: string,
+  ): string | null {
+    const failed = previews.filter((p) => p.error);
+    const preferred =
+      failed.find(
+        (p) => p.sharding === "Pipeline" && p.instance_meta === "MlxRing",
+      ) ?? failed[0];
+    return preferred?.error
+      ? describePlacementError(preferred.error, modelId)
+      : null;
+  }
+
+  // Helper to get model size in GB (from megabytes)
+  function getModelSizeGB(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): number {
+    if (model.storage_size_megabytes) {
+      return model.storage_size_megabytes / 1024;
+    }
+    return estimateMemoryGB(model.id, model.name);
+  }
+
+  // Calculate available memory in the cluster (in GB)
+  const availableMemoryGB = $derived(() => {
+    if (!data) return 0;
+    return (
+      Object.values(data.nodes).reduce((acc, n) => {
+        const total =
+          n.macmon_info?.memory?.ram_total ?? n.system_info?.memory ?? 0;
+        const used = n.macmon_info?.memory?.ram_usage ?? 0;
+        return acc + (total - used);
+      }, 0) /
+      (1024 * 1024 * 1024)
+    );
+  });
+
+  // Calculate total memory in the cluster (in GB)
+  const clusterTotalMemoryGB = $derived(() => {
+    if (!data) return 0;
+    return (
+      Object.values(data.nodes).reduce((acc, n) => {
+        const total =
+          n.macmon_info?.memory?.ram_total ?? n.system_info?.memory ?? 0;
+        return acc + total;
+      }, 0) /
+      (1024 * 1024 * 1024)
+    );
+  });
+
+  // What each device has of each model, indexed once per /state poll, and
+  // the disk fits worked out from it: a model's fit is asked for several
+  // times per poll (picker, recommendations, sorting)
+  const modelDownloadIndex = $derived(indexModelDownloads(downloadsData));
+  const diskFitMemo = $derived.by(() => {
+    void data;
+    void nodeDiskData;
+    void modelDownloadIndex;
+    return new Map<string, DiskFit>();
+  });
+
+  // Whether a model can be downloaded on the devices it would run on: each
+  // device downloads it into its models directory (see disk_fit.ts)
+  function getModelDiskFit(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): DiskFit {
+    if (!data) return { fits: true };
+    const memoized = diskFitMemo.get(model.id);
+    if (memoized) return memoized;
+    const onDevices = modelDownloadIndex.get(model.id);
+    const fit = checkDiskFit(
+      getModelSizeGB(model) * 1024 * 1024 * 1024,
+      Object.entries(data.nodes).map(([nodeId, node]) => {
+        const total =
+          node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
+        const used = node.macmon_info?.memory?.ram_usage ?? 0;
+        const has = onDevices?.get(nodeId);
+        return {
+          name: node.friendly_name || nodeId.slice(0, 8),
+          freeDiskBytes: nodeDiskData[nodeId]?.available?.inBytes ?? null,
+          freeMemoryBytes: total - used,
+          hasModel: has?.completed ?? false,
+          downloadedBytes: has?.downloadedBytes ?? 0,
+        };
+      }),
+    );
+    diskFitMemo.set(model.id, fit);
+    return fit;
+  }
+
+  // Why a model doesn't fit, when memory isn't the reason
+  function getModelFitNote(modelId: string): string | null {
+    const model = models.find((m) => m.id === modelId);
+    return model ? describeDiskFit(getModelDiskFit(model)) : null;
+  }
+
+  function getModelMemoryFitStatus(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): ModelMemoryFitStatus {
+    const modelSizeGB = getModelSizeGB(model);
+    if (modelSizeGB <= availableMemoryGB()) {
+      return getModelDiskFit(model).fits ? "fits_now" : "no_disk_space";
+    }
+    if (modelSizeGB <= clusterTotalMemoryGB()) {
+      return "fits_cluster_capacity";
+    }
+    return "too_large";
+  }
+
+  // Whether the devices have the disk space to download a model (or have it)
+  function canDownloadModel(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): boolean {
+    return getModelDiskFit(model).fits;
+  }
+
+  // Check if a model has enough memory to run
+  function hasEnoughMemory(model: {
+    id: string;
+    name?: string;
+    storage_size_megabytes?: number;
+  }): boolean {
+    return getModelMemoryFitStatus(model) === "fits_now";
+  }
+
+  // Sorted models for dropdown - biggest first, unrunnable at the end
+  const sortedModels = $derived(() => {
+    return [...models].sort((a, b) => {
+      // First: models that have enough memory come before those that don't
+      const aCanFit = hasEnoughMemory(a);
+      const bCanFit = hasEnoughMemory(b);
+      if (aCanFit && !bCanFit) return -1;
+      if (!aCanFit && bCanFit) return 1;
+
+      // Then: sort by size (biggest first)
+      const aSize = getModelSizeGB(a);
+      const bSize = getModelSizeGB(b);
+      return bSize - aSize;
+    });
+  });
+
+  // Compute model tags (FASTEST, BIGGEST)
+  const modelTags = $derived(() => {
+    const tags: Record<string, string[]> = {};
+    if (models.length === 0) return tags;
+
+    // Find the fastest model (highest TPS)
+    let fastestId = "";
+    let highestTps = 0;
+
+    // Find the biggest model (most memory)
+    let biggestId = "";
+    let highestMemory = 0;
+
+    for (const model of models) {
+      const perf = estimatePerformance(model.id);
+      const mem = getModelSizeGB(model);
+
+      if (perf.tps > highestTps) {
+        highestTps = perf.tps;
+        fastestId = model.id;
+      }
+
+      if (mem > highestMemory) {
+        highestMemory = mem;
+        biggestId = model.id;
+      }
+    }
+
+    if (fastestId) {
+      tags[fastestId] = tags[fastestId] || [];
+      tags[fastestId].push("FASTEST");
+    }
+
+    if (biggestId && biggestId !== fastestId) {
+      tags[biggestId] = tags[biggestId] || [];
+      tags[biggestId].push("BIGGEST");
+    } else if (biggestId === fastestId && biggestId) {
+      // Same model is both - unlikely but handle it
+      tags[biggestId].push("BIGGEST");
+    }
+
+    return tags;
+  });
+
+  onMount(async () => {
+    mounted = true;
+    fetchModels();
+    refreshLocalNodeId();
+
+    // Handle reset-onboarding query parameter (triggered from native Settings)
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("reset-onboarding")) {
+      localStorage.removeItem(ONBOARDING_COMPLETE_KEY);
+      window.history.replaceState({}, "", window.location.pathname);
+      // Asked for explicitly: show it even if a model is already running
+      onboardingStep = 6;
+      return;
+    }
+
+    // Firefox AI sidebar integration: handle ?q= query parameter
+    // Firefox's built-in AI sidebar (about:config: browser.ml.chat.enabled) sends
+    // the user's prompt as ?q=<URL-encoded prompt> to the configured provider URL.
+    // See: https://support.mozilla.org/en-US/kb/ai-chatbot
+    const queryParam = params.get("q");
+    if (queryParam) {
+      // Clean up the URL to prevent re-submission on page refresh
+      window.history.replaceState({}, "", window.location.pathname);
+      // Defer the auto-send until cluster state is loaded (topologyData,
+      // instances, availableMemory) so that model auto-selection works
+      // correctly. The $effect below will pick this up once data is ready.
+      pendingFirefoxQuery = queryParam;
+    }
+
+    // Check server-side onboarding state (persisted in ~/.exo)
+    try {
+      const res = await fetch("/onboarding");
+      if (res.ok) {
+        const data = await res.json();
+        if (!data.completed) {
+          awaitOnboardingDecision();
+        }
+        return;
+      }
+    } catch {
+      // Server unreachable — fall through to localStorage
+    }
+
+    // Fallback: check localStorage
+    if (!localStorage.getItem(ONBOARDING_COMPLETE_KEY)) {
+      awaitOnboardingDecision();
+    }
+  });
+
+  // Onboarding isn't done: decide once the first cluster state is in (see
+  // below). If it doesn't come, show onboarding anyway.
+  const ONBOARDING_DECISION_TIMEOUT_MS = 5_000;
+  function awaitOnboardingDecision() {
+    onboardingDecisionPending = true;
+    setTimeout(() => {
+      if (onboardingDecisionPending) decideOnboarding();
+    }, ONBOARDING_DECISION_TIMEOUT_MS);
+  }
+
+  // Decide once the cluster state and the model list (for the model's name)
+  // are in
+  $effect(() => {
+    if (onboardingDecisionPending && update && models.length > 0) {
+      decideOnboarding();
+    }
+  });
+
+  // A device that joins a cluster that already runs a model skips onboarding:
+  // the cluster is set up, so say so and offer the chat instead. So does one
+  // whose cluster has a model launched that isn't running now (paused after
+  // every device restarted, or waiting): its card shows what to do. A device on
+  // its own, or in a cluster with nothing launched, gets onboarding.
+  function decideOnboarding() {
+    onboardingDecisionPending = false;
+    const modelId =
+      bestRunningModelId ??
+      Object.values(instanceData)
+        .map((inst) => getInstanceModelId(inst))
+        .find((id) => id !== "Unknown" && id !== "Unknown Model");
+    const decision = onboardingDecision(modelId, pendingDeployments.length);
+    if (decision === "onboard") {
+      onboardingStep = 6;
+      return;
+    }
+    completeOnboarding();
+    if (decision === "announce" && modelId) announceJoinedCluster(modelId);
+  }
+
+  // Whether the device serving this dashboard is a Mac. Mac models are "Mac
+  // Studio", "MacBook Pro", "Mac mini", ...; before /node_id answers, every
+  // device in the cluster has to be a Mac.
+  const localDeviceIsMac = $derived.by(() => {
+    const isMac = (node?: NodeInfo) =>
+      node?.system_info?.model_id?.startsWith("Mac") ?? false;
+    const localNode = localNodeId ? data?.nodes?.[localNodeId] : undefined;
+    if (localNode) return isMac(localNode);
+    const nodes = Object.values(data?.nodes ?? {});
+    return nodes.length > 0 && nodes.every(isMac);
+  });
+
+  function announceJoinedCluster(modelId: string) {
+    const thisDevice = localDeviceIsMac ? "This Mac" : "This device";
+    const joined =
+      nodeCount > 1
+        ? `${thisDevice} joined your cluster (${nodeCount} devices · ${Math.round(clusterTotalMemoryGB())} GB). `
+        : "";
+    const state = hasRunningInstance(modelId) ? "ready" : "starting";
+    addToast({
+      type: "success",
+      message: `${joined}${getModelDisplayName(modelId)} is ${state}.`,
+      duration: 15_000,
+      action: {
+        label: "Chat",
+        onClick: () => void launchModelForChat(modelId, "auto"),
+      },
+    });
+  }
+
+  // Deferred Firefox AI sidebar auto-send: wait for cluster state and model
+  // list before submitting. Both data (from /state polling) and models (from
+  // the async /models fetch in onMount) must be loaded for handleAutoSend to
+  // correctly auto-select a model.
+  $effect(() => {
+    if (pendingFirefoxQuery && data && models.length > 0) {
+      const query = pendingFirefoxQuery;
+      pendingFirefoxQuery = null;
+      handleChatSend(query);
+    }
+  });
+
+  async function fetchModels() {
+    try {
+      const response = await fetch("/models");
+      if (response.ok) {
+        const data = await response.json();
+        // API returns { data: [{ id, name }] } format
+        models = data.data || [];
+        // Restore last launch defaults if available
+        const currentNodeCount = topologyData()
+          ? Object.keys(topologyData()!.nodes).length
+          : 1;
+        applyLaunchDefaults(models, currentNodeCount);
+      }
+    } catch (error) {
+      console.error("Failed to fetch models:", error);
+    }
+  }
+
+  async function addModelFromPicker(modelId: string) {
+    const response = await fetch("/models/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: modelId }),
+    });
+
+    if (!response.ok) {
+      let message = `Failed to add model (${response.status}: ${response.statusText})`;
+      try {
+        const err = await response.json();
+        if (err.detail) message = err.detail;
+      } catch {
+        // use default message
+      }
+      throw new Error(message);
+    }
+
+    await fetchModels();
+  }
+
+  async function deleteCustomModel(modelId: string) {
+    try {
+      const response = await fetch(
+        `/models/custom/${encodeURIComponent(modelId)}`,
+        { method: "DELETE" },
+      );
+      if (response.ok) {
+        await fetchModels();
+      }
+    } catch {
+      console.error("Failed to delete custom model");
+    }
+  }
+
+  function handleModelPickerSelect(modelId: string) {
+    selectPreviewModel(modelId);
+    setSelectedChatModel(modelId);
+    saveLaunchDefaults();
+    isModelPickerOpen = false;
+  }
+
+  async function launchInstance(
+    modelId: string,
+    specificPreview?: PlacementPreview | null,
+  ) {
+    if (!modelId || launchingModelId) return;
+
+    launchingModelId = modelId;
+
+    try {
+      // Use the specific preview if provided, otherwise fall back to filtered preview
+      const preview = specificPreview ?? filteredPreview();
+
+      let response: Response;
+      if (preview?.instance) {
+        // Launch with pre-computed placement from preview. What the user chose
+        // (a preview, a number of devices, the devices) is kept when exo starts
+        // the model again after a device leaves
+        response = await fetch("/instance", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            instance: preview.instance,
+            constraints: launchConstraints(
+              selectedMinNodes,
+              specificPreview ? getPreviewNodeCount(specificPreview) : null,
+              nodeFilter,
+            ),
+          }),
+        });
+      } else {
+        // No preview available — use place_instance to let server decide placement
+        response = await fetch("/place_instance", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_id: modelId,
+            sharding: selectedSharding,
+            instance_meta: selectedInstanceType,
+            min_nodes: selectedMinNodes,
+          }),
+        });
+      }
+
+      if (!response.ok) {
+        const errorText = await readApiErrorMessage(response);
+        console.error("Failed to launch instance:", errorText);
+        addToast({
+          type: "error",
+          message: `Couldn't start ${getModelDisplayName(modelId)}: ${errorText}`,
+        });
+      } else {
+        addToast({
+          type: "info",
+          message: `Starting ${getModelDisplayName(modelId)}…`,
+        });
+        // Always auto-select the newly launched model so the user chats to what they just launched
+        setSelectedChatModel(modelId);
+        userForcedIdle = false;
+        pendingChatModelId = modelId;
+        chatLaunchState = "launching";
+
+        // Record the launch in recent models history
+        recordRecentLaunch(modelId);
+
+        // Scroll to the bottom of instances container to show the new instance
+        // Use multiple attempts to ensure DOM has updated with the new instance
+        const scrollToBottom = () => {
+          if (instancesContainerRef) {
+            instancesContainerRef.scrollTo({
+              top: instancesContainerRef.scrollHeight,
+              behavior: "smooth",
+            });
+          }
+        };
+        setTimeout(scrollToBottom, 200);
+        setTimeout(scrollToBottom, 500);
+        setTimeout(scrollToBottom, 1000);
+      }
+    } catch (error) {
+      console.error("Error launching instance:", error);
+      addToast({
+        type: "error",
+        message: `Couldn't start ${getModelDisplayName(modelId)}. The browser console has details.`,
+      });
+    } finally {
+      launchingModelId = null;
+    }
+  }
+
+  // Helper to extract model ID from download shard metadata
+  function extractModelIdFromDownload(
+    downloadPayload: Record<string, unknown>,
+  ): string | null {
+    const shardMetadata =
+      downloadPayload.shard_metadata ?? downloadPayload.shardMetadata;
+    if (!shardMetadata || typeof shardMetadata !== "object") return null;
+
+    // Shard metadata is a tagged union: { PipelineShardMetadata: {...} } or { TensorShardMetadata: {...} }
+    const shardObj = shardMetadata as Record<string, unknown>;
+    const shardKeys = Object.keys(shardObj);
+    if (shardKeys.length !== 1) return null;
+
+    const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
+    if (!shardData) return null;
+
+    // Model meta is nested: shard.model_card.model_id
+    const modelMeta = shardData.model_card ?? shardData.modelCard;
+    if (!modelMeta || typeof modelMeta !== "object") return null;
+
+    const meta = modelMeta as Record<string, unknown>;
+    return (meta.model_id as string) ?? (meta.modelId as string) ?? null;
+  }
+
+  // Helper to parse download progress from payload
+  function parseDownloadProgress(
+    payload: Record<string, unknown>,
+  ): DownloadProgress | null {
+    const progress = payload.download_progress ?? payload.downloadProgress;
+    if (!progress || typeof progress !== "object") return null;
+
+    const prog = progress as Record<string, unknown>;
+    const totalBytes = getBytes(prog.total);
+    const downloadedBytes = getBytes(prog.downloaded);
+    const speed = (prog.speed as number) ?? 0;
+    const completedFiles =
+      (prog.completed_files as number) ?? (prog.completedFiles as number) ?? 0;
+    const totalFiles =
+      (prog.total_files as number) ?? (prog.totalFiles as number) ?? 0;
+    const etaMs = (prog.eta_ms as number) ?? (prog.etaMs as number) ?? 0;
+
+    const files: DownloadProgress["files"] = [];
+    const filesObj = (prog.files ?? {}) as Record<string, unknown>;
+    for (const [fileName, fileData] of Object.entries(filesObj)) {
+      if (!fileData || typeof fileData !== "object") continue;
+      const fd = fileData as Record<string, unknown>;
+      const fTotal = getBytes(fd.total);
+      const fDownloaded = getBytes(fd.downloaded);
+      files.push({
+        name: fileName,
+        totalBytes: fTotal,
+        downloadedBytes: fDownloaded,
+        speed: (fd.speed as number) ?? 0,
+        etaMs: (fd.eta_ms as number) ?? (fd.etaMs as number) ?? 0,
+        percentage: fTotal > 0 ? (fDownloaded / fTotal) * 100 : 0,
+      });
+    }
+
+    return {
+      totalBytes,
+      downloadedBytes,
+      speed,
+      etaMs:
+        etaMs ||
+        (speed > 0 ? ((totalBytes - downloadedBytes) / speed) * 1000 : 0),
+      percentage: totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0,
+      completedFiles,
+      totalFiles,
+      files,
+    };
+  }
+
+  // Helper to get download status for a model (checks all downloads for matching model ID)
+  type NodeDownloadStatus = {
+    nodeId: string;
+    nodeName: string;
+    status: "completed" | "partial" | "pending" | "downloading";
+    percentage: number;
+    progress: DownloadProgress | null;
+  };
+
+  // Shared helper: collect per-node download status for a model across a set of nodes.
+  // Handles deduplication, entry parsing, and aggregation in one place.
+  // With nodeIds (the devices of an instance or a placement), every one of
+  // them counts in the total, finished or not started yet; a device that
+  // hasn't said how much it needs counts as estimatedNodeBytes (see
+  // totalDownload). Without, only devices downloading it count; a device that
+  // has none of a model doesn't list it at all.
+  function collectDownloadStatus(
+    modelId: string,
+    nodeIds?: string[],
+    estimatedNodeBytes = 0,
+  ): {
+    isDownloading: boolean;
+    progress: DownloadProgress | null;
+    perNode: NodeDownloadStatus[];
+    failedError: string | null;
+  } {
+    const empty = {
+      isDownloading: false,
+      progress: null,
+      perNode: [] as NodeDownloadStatus[],
+      failedError: null,
+    };
+
+    if (!downloadsData || Object.keys(downloadsData).length === 0) {
+      return empty;
+    }
+
+    // Deduplicate by nodeId — a node can have multiple entries for the same model
+    // (e.g. PipelineShardMetadata + TensorShardMetadata). Keep the last entry,
+    // which is the most recently applied event.
+    const perNodeMap = new Map<string, NodeDownloadStatus>();
+    // How much each device has and needs, for the total
+    const amounts = new Map<string, NodeDownload>();
+    // The stalled devices, to say why the model's download is stalled
+    const stalls: Parameters<typeof describeStalls>[0] = [];
+
+    const nodeIdSet = nodeIds ? new Set(nodeIds) : null;
+    for (const [nodeId, nodeDownloads] of Object.entries(downloadsData)) {
+      if (nodeIdSet && !nodeIdSet.has(nodeId)) continue;
+      if (!Array.isArray(nodeDownloads)) continue;
+
+      for (const downloadWrapped of nodeDownloads) {
+        if (!downloadWrapped || typeof downloadWrapped !== "object") continue;
+
+        const keys = Object.keys(downloadWrapped as Record<string, unknown>);
+        if (keys.length !== 1) continue;
+
+        const downloadKind = keys[0];
+        const downloadPayload = (downloadWrapped as Record<string, unknown>)[
+          downloadKind
+        ] as Record<string, unknown>;
+        if (!downloadPayload) continue;
+
+        const downloadModelId = extractModelIdFromDownload(downloadPayload);
+        if (!downloadModelId || downloadModelId !== modelId) continue;
+
+        // DownloadFailed — return with any data collected so far
+        if (downloadKind === "DownloadFailed") {
+          return {
+            isDownloading: false,
+            progress: null,
+            perNode: Array.from(perNodeMap.values()),
+            failedError:
+              (downloadPayload.errorMessage as string) ||
+              (downloadPayload.error_message as string) ||
+              "Download failed",
+          };
+        }
+
+        if (
+          downloadKind !== "DownloadOngoing" &&
+          downloadKind !== "DownloadPending" &&
+          downloadKind !== "DownloadCompleted"
+        )
+          continue;
+
+        const nodeName =
+          data?.nodes?.[nodeId]?.friendly_name ?? nodeId.slice(0, 8);
+
+        if (downloadKind === "DownloadCompleted") {
+          perNodeMap.set(nodeId, {
+            nodeId,
+            nodeName,
+            status: "completed",
+            percentage: 100,
+            progress: null,
+          });
+          if (nodeIdSet)
+            amounts.set(nodeId, {
+              nodeId,
+              state: "completed",
+              downloadedBytes: 0,
+              totalBytes: getBytes(
+                downloadPayload.total ??
+                  downloadPayload.total_bytes ??
+                  downloadPayload.totalBytes,
+              ),
+              speed: 0,
+            });
+          continue;
+        }
+
+        if (downloadKind === "DownloadPending") {
+          const pendingDownloaded = getBytes(
+            downloadPayload.downloaded ??
+              downloadPayload.downloaded_bytes ??
+              downloadPayload.downloadedBytes,
+          );
+          const pendingTotal = getBytes(
+            downloadPayload.total ??
+              downloadPayload.total_bytes ??
+              downloadPayload.totalBytes,
+          );
+          if (pendingDownloaded <= 0 && pendingTotal <= 0) continue;
+          const pct =
+            pendingTotal > 0 ? (pendingDownloaded / pendingTotal) * 100 : 0;
+          perNodeMap.set(nodeId, {
+            nodeId,
+            nodeName,
+            status: pendingDownloaded > 0 ? "partial" : "pending",
+            percentage: pct,
+            progress: null,
+          });
+          if (nodeIdSet)
+            amounts.set(nodeId, {
+              nodeId,
+              state: "pending",
+              downloadedBytes: pendingDownloaded,
+              totalBytes: pendingTotal,
+              speed: 0,
+            });
+          continue;
+        }
+
+        // DownloadOngoing. One at 0 of 0 bytes is downloading too: it can't
+        // list the model's files yet (e.g. Hugging Face is unreachable)
+        const progress = parseDownloadProgress(downloadPayload);
+        if (!progress) continue;
+        // The device's own speed is an average since the start; time the
+        // bytes here for whether it's moving and when it will finish
+        const activity = downloadActivityData[downloadKey(nodeId, modelId)];
+        const now = Date.now();
+        const nodeEtaMs =
+          progress.totalBytes > 0
+            ? estimateRemainingMs(
+                progress.totalBytes - progress.downloadedBytes,
+                activity,
+                now,
+              )
+            : null;
+        progress.stalled = isStalled(activity, now);
+        if (progress.stalled) {
+          progress.stalledText = describeStall(
+            activity,
+            progress.totalBytes,
+            now,
+          );
+          stalls.push({ activity, totalBytes: progress.totalBytes });
+        }
+        progress.etaMs = nodeEtaMs ?? 0;
+
+        perNodeMap.set(nodeId, {
+          nodeId,
+          nodeName,
+          status: "downloading",
+          percentage: progress.percentage,
+          progress,
+        });
+        amounts.set(nodeId, {
+          nodeId,
+          state: "downloading",
+          downloadedBytes: progress.downloadedBytes,
+          totalBytes: progress.totalBytes,
+          speed: progress.speed,
+          etaMs: nodeEtaMs,
+        });
+      }
+    }
+    // Devices of the instance that haven't reported any progress yet
+    for (const nodeId of nodeIds ?? []) {
+      if (!amounts.has(nodeId)) {
+        amounts.set(nodeId, {
+          nodeId,
+          state: "missing",
+          downloadedBytes: 0,
+          totalBytes: 0,
+          speed: 0,
+        });
+      }
+    }
+
+    // Aggregate from deduplicated per-node entries
+    const perNode = Array.from(perNodeMap.values());
+    let completedFiles = 0;
+    let totalFiles = 0;
+    let isDownloading = false;
+    const allFiles: DownloadProgress["files"] = [];
+
+    let allStalled = true;
+    for (const node of perNode) {
+      if (node.status === "downloading" && node.progress) {
+        isDownloading = true;
+        allStalled &&= node.progress.stalled === true;
+        completedFiles += node.progress.completedFiles;
+        totalFiles += node.progress.totalFiles;
+        allFiles.push(...node.progress.files);
+      }
+    }
+
+    if (!isDownloading) {
+      return {
+        isDownloading: false,
+        progress: null,
+        perNode,
+        failedError: null,
+      };
+    }
+
+    // Every device counts, finished ones too, so the total only goes forward
+    const knownTotals = [...amounts.values()].map((node) => node.totalBytes);
+    const total = totalDownload(
+      [...amounts.values()],
+      estimatedNodeBytes > 0 ? estimatedNodeBytes : Math.max(0, ...knownTotals),
+    );
+
+    return {
+      isDownloading: true,
+      progress: {
+        totalBytes: total.totalBytes,
+        downloadedBytes: total.downloadedBytes,
+        speed: total.speed,
+        // 0: not known yet
+        etaMs: total.etaMs ?? 0,
+        stalled: allStalled,
+        stalledText: allStalled
+          ? describeStalls(stalls, Date.now())
+          : undefined,
+        percentage: total.percentage,
+        completedFiles,
+        totalFiles,
+        files: allFiles,
+      },
+      perNode,
+      failedError: null,
+    };
+  }
+
+  // A model's download. Without nodeIds, a running (or starting) instance of
+  // it decides which devices count: the chat view's progress is its download.
+  function getModelDownloadStatus(
+    modelId: string,
+    nodeIds?: string[],
+  ): {
+    isDownloading: boolean;
+    progress: DownloadProgress | null;
+    perNode: NodeDownloadStatus[];
+  } {
+    if (!nodeIds) {
+      for (const [, inst] of Object.entries(instanceData)) {
+        if (getInstanceModelId(inst) !== modelId) continue;
+        const [, instance] = getTagged(inst);
+        const shardAssignments = (
+          instance as {
+            shardAssignments?: {
+              nodeToRunner?: Record<string, string>;
+              runnerToShard?: Record<string, unknown>;
+            };
+          } | null
+        )?.shardAssignments;
+        return collectDownloadStatus(
+          modelId,
+          Object.keys(shardAssignments?.nodeToRunner ?? {}),
+          getInstanceModelBytes(shardAssignments?.runnerToShard ?? {}),
+        );
+      }
+    }
+    return collectDownloadStatus(modelId, nodeIds);
+  }
+
+  // The size of an instance's model (its card's storage size), which is the
+  // most any one device downloads; 0 when unknown
+  function getInstanceModelBytes(runnerToShard: Record<string, unknown>) {
+    for (const shardWrapped of Object.values(runnerToShard)) {
+      const [, shard] = getTagged(shardWrapped);
+      const bytes = getBytes(
+        (shard as { modelCard?: { storageSize?: unknown } } | null)?.modelCard
+          ?.storageSize,
+      );
+      if (bytes > 0) return bytes;
+    }
+    return 0;
+  }
+
+  // Helper to get download status for an instance
+  function getInstanceDownloadStatus(
+    instanceId: string,
+    instanceWrapped: unknown,
+  ): {
+    isDownloading: boolean;
+    isFailed: boolean;
+    errorMessage: string | null;
+    progress: DownloadProgress | null;
+    statusText: string;
+    perNode: NodeDownloadStatus[];
+  } {
+    // Unwrap the instance to get shard assignments
+    const [instanceTag, instance] = getTagged(instanceWrapped);
+    if (!instance || typeof instance !== "object") {
+      return {
+        isDownloading: false,
+        isFailed: false,
+        errorMessage: null,
+        progress: null,
+        statusText: "PREPARING",
+        perNode: [],
+      };
+    }
+
+    const inst = instance as {
+      shardAssignments?: {
+        nodeToRunner?: Record<string, string>;
+        runnerToShard?: Record<string, unknown>;
+        modelId?: string;
+      };
+    };
+    const instanceModelId = inst.shardAssignments?.modelId;
+
+    if (!instanceModelId) {
+      const statusInfo = deriveInstanceStatus(instanceWrapped);
+      return {
+        isDownloading: false,
+        isFailed: statusInfo.statusText === "FAILED",
+        errorMessage: statusInfo.errorMessage ?? null,
+        progress: null,
+        statusText: statusInfo.statusText,
+        perNode: [],
+      };
+    }
+
+    // Get node IDs assigned to this instance
+    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
+    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
+    const runnerToNode: Record<string, string> = {};
+    for (const [nodeId, runnerId] of Object.entries(nodeToRunner)) {
+      runnerToNode[runnerId] = nodeId;
+    }
+    const instanceNodeIds = Object.keys(runnerToShard)
+      .map((runnerId) => runnerToNode[runnerId])
+      .filter(Boolean);
+
+    const result = collectDownloadStatus(
+      instanceModelId,
+      instanceNodeIds,
+      getInstanceModelBytes(runnerToShard),
+    );
+
+    if (result.failedError) {
+      return {
+        isDownloading: false,
+        isFailed: true,
+        errorMessage: result.failedError,
+        progress: null,
+        statusText: "FAILED",
+        perNode: [],
+      };
+    }
+
+    if (!result.isDownloading) {
+      const statusInfo = deriveInstanceStatus(instanceWrapped);
+      return {
+        isDownloading: false,
+        isFailed: statusInfo.statusText === "FAILED",
+        errorMessage: statusInfo.errorMessage ?? null,
+        progress: null,
+        statusText: statusInfo.statusText,
+        perNode: result.perNode,
+      };
+    }
+
+    return {
+      isDownloading: true,
+      isFailed: false,
+      errorMessage: null,
+      progress: result.progress,
+      statusText: "DOWNLOADING",
+      perNode: result.perNode,
+    };
+  }
+
+  // The few instance states people act on, for display only. Logic keeps
+  // using the raw statusText (READY, WARMING UP, ...); debug mode shows it
+  // next to the label.
+  type InstanceStatusLabel =
+    | "Downloading"
+    | "Starting"
+    | "Ready"
+    | "Unavailable"
+    | "Reconnecting"
+    | "Failed"
+    | "Stopping";
+
+  function getInstanceStatusLabel(statusText: string): InstanceStatusLabel {
+    switch (statusText) {
+      case "DOWNLOADING":
+        return "Downloading";
+      case "READY":
+      case "LOADED":
+      case "RUNNING":
+        return "Ready";
+      case "FAILED":
+        return "Failed";
+      case "SHUTDOWN":
+      case "SHUTTING DOWN":
+        return "Stopping";
+      case "UNAVAILABLE":
+        return "Unavailable";
+      case "RECONNECTING":
+        return "Reconnecting";
+      default:
+        // Every state before ready: PREPARING, INITIALIZING, LOADING, ...
+        return "Starting";
+    }
+  }
+
+  // One colour per status, the same everywhere a running model is shown and
+  // always next to the status word: Downloading blue, Starting yellow, Ready
+  // green, Unavailable and Reconnecting orange, Failed red, Stopping grey.
+  // Full class names, so Tailwind keeps them.
+  const STATUS_COLORS: Record<
+    InstanceStatusLabel,
+    {
+      text: string;
+      badge: string;
+      dot: string;
+      corner: string;
+      card: string;
+    }
+  > = {
+    Downloading: {
+      text: "text-blue-400",
+      badge: "bg-blue-500/15 text-blue-400",
+      dot: "bg-blue-400 animate-pulse",
+      corner: "border-blue-500/50",
+      card: "border-blue-500/30 border-l-blue-400 group-hover:border-blue-500/50",
+    },
+    Starting: {
+      text: "text-yellow-400",
+      badge: "bg-yellow-500/15 text-yellow-400",
+      dot: "bg-yellow-400 animate-pulse",
+      corner: "border-yellow-500/50",
+      card: "border-yellow-500/30 border-l-yellow-400 group-hover:border-yellow-500/50",
+    },
+    Ready: {
+      text: "text-green-400",
+      badge: "bg-green-500/15 text-green-400",
+      dot: "bg-green-400",
+      corner: "border-green-500/50",
+      card: "border-green-500/30 border-l-green-400 group-hover:border-green-500/50",
+    },
+    Unavailable: {
+      text: "text-orange-400",
+      badge: "bg-orange-500/15 text-orange-400",
+      dot: "bg-orange-400 animate-pulse",
+      corner: "border-orange-500/50",
+      card: "border-orange-500/30 border-l-orange-400 group-hover:border-orange-500/50",
+    },
+    Reconnecting: {
+      text: "text-orange-400",
+      badge: "bg-orange-500/15 text-orange-400",
+      dot: "bg-orange-400 animate-pulse",
+      corner: "border-orange-500/50",
+      card: "border-orange-500/30 border-l-orange-400 group-hover:border-orange-500/50",
+    },
+    Failed: {
+      text: "text-red-400",
+      badge: "bg-red-500/15 text-red-400",
+      dot: "bg-red-400",
+      corner: "border-red-500/50",
+      card: "border-red-500/30 border-l-red-400 group-hover:border-red-500/50",
+    },
+    Stopping: {
+      text: "text-gray-400",
+      badge: "bg-gray-500/15 text-gray-400",
+      dot: "bg-gray-400",
+      corner: "border-gray-500/50",
+      card: "border-gray-500/30 border-l-gray-400 group-hover:border-gray-500/50",
+    },
+  };
+
+  // How a runner fails when another runner of its instance stops: the ring or
+  // JACCL connection to it breaks. The reason is on the other device.
+  const LOST_PEER_FAILURE =
+    /connection to a peer was lost|lost the connection to the instance's other runners|ring socket receive failed|ring transport aborted|\[(ring|jaccl)\]/i;
+
+  type RunnerFailure = { device: string; reason: string; lostPeer: boolean };
+
+  // Each failed runner of an instance, with its device and its reasons: known
+  // diagnostics first (they name the cause, e.g. a Metal GPU timeout), then its
+  // error message. Runners that failed on their own come first, then those that
+  // only lost the connection to them.
+  function getRunnerFailures(
+    runnerIds: string[],
+    runnerToNode: Record<string, string>,
+  ): RunnerFailure[] {
+    const failures: RunnerFailure[] = [];
+    for (const rid of runnerIds) {
+      const [kind, payload] = getTagged(runnersData[rid]);
+      if (kind !== "RunnerFailed" || !payload || typeof payload !== "object")
+        continue;
+      const failed = payload as {
+        errorMessage?: string | null;
+        diagnostics?: unknown[];
+      };
+      const reasons = new Set<string>();
+      for (const diagnostic of failed.diagnostics ?? []) {
+        const [, detail] = getTagged(diagnostic);
+        const message = (detail as { message?: unknown } | null)?.message;
+        if (typeof message === "string" && message) reasons.add(message);
+      }
+      if (failed.errorMessage) reasons.add(failed.errorMessage);
+      if (reasons.size === 0) continue;
+      const reason = [...reasons].join("\n");
+      const nodeId = runnerToNode[rid];
+      failures.push({
+        device: nodeId ? getNodeName(nodeId) : "A device",
+        reason,
+        lostPeer: LOST_PEER_FAILURE.test(reason),
+      });
+    }
+    return failures.sort((a, b) => Number(a.lostPeer) - Number(b.lostPeer));
+  }
+
+  // Why an instance's runners failed. The first line names the device that
+  // failed on its own and why; every runner's full reason follows.
+  function getRunnerFailureMessage(
+    runnerIds: string[],
+    runnerToNode: Record<string, string>,
+  ): string | undefined {
+    const failures = getRunnerFailures(runnerIds, runnerToNode);
+    if (failures.length === 0) return undefined;
+    const [first] = failures;
+    return [
+      `${first.device}: ${summarizeFailureReason(first.reason)}`,
+      ...failures.map(({ device, reason }) => `${device}: ${reason}`),
+    ].join("\n");
+  }
+
+  function getRunnerToNode(instanceWrapped: unknown): Record<string, string> {
+    const [, instance] = getTagged(instanceWrapped);
+    const inst = instance as {
+      shardAssignments?: { nodeToRunner?: Record<string, string> };
+    } | null;
+    const runnerToNode: Record<string, string> = {};
+    for (const [nodeId, runnerId] of Object.entries(
+      inst?.shardAssignments?.nodeToRunner ?? {},
+    )) {
+      runnerToNode[runnerId] = nodeId;
+    }
+    return runnerToNode;
+  }
+
+  // Whether a runner of the instance failed on its own, rather than only losing
+  // the connection to one that did (whose failure may not be in yet)
+  function isFailureExplained(instanceWrapped: unknown): boolean {
+    const runnerToNode = getRunnerToNode(instanceWrapped);
+    return getRunnerFailures(Object.keys(runnerToNode), runnerToNode).some(
+      (failure) => !failure.lostPeer,
+    );
+  }
+
+  // One readable line from a failure message. A runner that raised is
+  // reported as "Terminated (exitcode=1\nRunner error: <error>\n<traceback>)"
+  // (worker/runner/supervisor.py), so prefer the error over the bare exit
+  // status. Diagnostics and one-line reasons are returned as they are.
+  function summarizeFailureReason(message: string): string {
+    const lines = message
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const first = lines[0] ?? message;
+    if (!first.startsWith("Terminated (")) return first;
+    const index = lines.findIndex((line) => line.startsWith("Runner error:"));
+    if (index === -1) return first;
+    const runnerError = lines[index].slice("Runner error:".length).trim();
+    // A reason the supervisor stopped the runner for has no traceback after
+    // it, so it ends with the closing parenthesis of "Terminated (…)"
+    return index === lines.length - 1 && runnerError.endsWith(")")
+      ? runnerError.slice(0, -1).trimEnd()
+      : runnerError;
+  }
+
+  // Statuses that come from the runners' last reports, which a device that
+  // froze, quit or crashed never updates. What /state says about the model's
+  // devices and runners can contradict them (see instance_health.ts).
+  const STATUSES_THE_CLUSTER_CAN_CONTRADICT = new Set([
+    "READY",
+    "LOADED",
+    "RUNNING",
+    "WARMING UP",
+    "LOADING",
+    "CONNECTING",
+    "CONNECTED",
+    "INITIALIZING",
+    "PREPARING",
+  ]);
+
+  // Why a model that its runners call ready (or starting) can't serve now:
+  // a device of it went quiet or left, part of it stopped, or this dashboard
+  // hears from no device at all. Null when nothing contradicts the runners.
+  function getInstanceHealthNote(
+    instanceWrapped: unknown,
+    statusText: string,
+  ): { statusText: "UNAVAILABLE" | "RECONNECTING"; message: string } | null {
+    if (!STATUSES_THE_CLUSTER_CAN_CONTRADICT.has(statusText)) return null;
+    const [, instance] = getTagged(instanceWrapped);
+    const nodeToRunner =
+      (
+        instance as {
+          shardAssignments?: { nodeToRunner?: Record<string, string> };
+        } | null
+      )?.shardAssignments?.nodeToRunner ?? {};
+    const health = checkInstanceHealth({
+      nodeToRunner,
+      runnerStatus: (runnerId) =>
+        getTagged(runnersData[runnerId])[0] ?? undefined,
+      clusterNodeIds: new Set(Object.keys(data?.nodes ?? {})),
+      heardAt: heardAtData,
+      now: Date.now(),
+    });
+    const message = describeInstanceHealth(health, getNodeName);
+    if (!message) return null;
+    return {
+      statusText:
+        health.kind === "cluster-silent" ? "RECONNECTING" : "UNAVAILABLE",
+      message,
+    };
+  }
+
+  // Said to screen readers when a model becomes unavailable or reconnecting,
+  // or its reason changes (the card shows it in orange)
+  let healthAnnouncement = $state("");
+  let previousHealthNotes: Record<string, string> = {};
+  $effect(() => {
+    const notes: Record<string, string> = {};
+    for (const [id, inst] of Object.entries(instanceData)) {
+      const note = getInstanceHealthNote(
+        inst,
+        getInstanceDownloadStatus(id, inst).statusText,
+      );
+      if (!note) continue;
+      const state =
+        note.statusText === "RECONNECTING" ? "reconnecting" : "unavailable";
+      notes[id] =
+        `${getModelDisplayName(getInstanceModelId(inst))} is ${state}: ${note.message}`;
+    }
+    const fresh = Object.entries(notes)
+      .filter(([id, text]) => previousHealthNotes[id] !== text)
+      .map(([, text]) => text);
+    if (fresh.length > 0) healthAnnouncement = fresh.join(". ");
+    previousHealthNotes = notes;
+  });
+
+  function deriveInstanceStatus(instanceWrapped: unknown): {
+    statusText: string;
+    statusClass: string;
+    errorMessage?: string;
+    layersLoaded?: number;
+    totalLayers?: number;
+  } {
+    const [instanceTag, instance] = getTagged(instanceWrapped);
+    if (!instance || typeof instance !== "object") {
+      return { statusText: "PREPARING", statusClass: "inactive" };
+    }
+
+    const inst = instance as {
+      shardAssignments?: { runnerToShard?: Record<string, unknown> };
+    };
+    const runnerIds = Object.keys(inst.shardAssignments?.runnerToShard || {});
+
+    const statuses = runnerIds
+      .map((rid) => {
+        const r = runnersData[rid];
+        if (!r) return null;
+        const [kind] = getTagged(r);
+        // Every RunnerStatus the backend sends (shared/types/worker/runners.py)
+        const statusMap: Record<string, string> = {
+          RunnerIdle: "Idle",
+          RunnerConnecting: "Connecting",
+          RunnerConnected: "Connected",
+          RunnerLoading: "Loading",
+          RunnerLoaded: "Loaded",
+          RunnerWarmingUp: "WarmingUp",
+          RunnerReady: "Ready",
+          RunnerRunning: "Running",
+          RunnerShuttingDown: "ShuttingDown",
+          RunnerShutdown: "Shutdown",
+          RunnerFailed: "Failed",
+        };
+        return kind ? statusMap[kind] || null : null;
+      })
+      .filter((s): s is string => s !== null);
+
+    const has = (s: string) => statuses.includes(s);
+
+    if (statuses.length === 0)
+      return { statusText: "PREPARING", statusClass: "inactive" };
+    if (has("Failed"))
+      return {
+        statusText: "FAILED",
+        statusClass: "failed",
+        errorMessage: getRunnerFailureMessage(
+          runnerIds,
+          getRunnerToNode(instanceWrapped),
+        ),
+      };
+    if (has("Shutdown"))
+      return { statusText: "SHUTDOWN", statusClass: "inactive" };
+    if (has("ShuttingDown"))
+      return { statusText: "SHUTTING DOWN", statusClass: "inactive" };
+    if (has("Loading")) {
+      // Tensor parallel: each runner loads all layers — use max/min (bottleneck)
+      // Pipeline parallel: each runner loads a disjoint slice — use sum
+      const isTensor = instanceTag === "MlxJacclInstance";
+      let layersLoaded = isTensor ? Infinity : 0;
+      let totalLayers = 0;
+      for (const rid of runnerIds) {
+        const r = runnersData[rid];
+        if (!r) continue;
+        const [kind, payload] = getTagged(r);
+        if (
+          kind === "RunnerLoading" &&
+          payload &&
+          typeof payload === "object"
+        ) {
+          const p = payload as { layersLoaded?: number; totalLayers?: number };
+          if (isTensor) {
+            layersLoaded = Math.min(layersLoaded, p.layersLoaded ?? 0);
+            totalLayers = Math.max(totalLayers, p.totalLayers ?? 0);
+          } else {
+            layersLoaded += p.layersLoaded ?? 0;
+            totalLayers += p.totalLayers ?? 0;
+          }
+        }
+      }
+      if (isTensor && layersLoaded === Infinity) layersLoaded = 0;
+      return {
+        statusText: "LOADING",
+        statusClass: "starting",
+        layersLoaded,
+        totalLayers,
+      };
+    }
+    if (has("WarmingUp"))
+      return { statusText: "WARMING UP", statusClass: "starting" };
+    if (has("Running"))
+      return { statusText: "RUNNING", statusClass: "running" };
+    if (has("Ready")) return { statusText: "READY", statusClass: "loaded" };
+    if (has("Loaded")) return { statusText: "LOADED", statusClass: "loaded" };
+    // Runners of a multi-device instance connect to each other before loading;
+    // the group is connecting until every runner has connected
+    if (has("Connecting"))
+      return { statusText: "CONNECTING", statusClass: "starting" };
+    if (has("Connected"))
+      return { statusText: "CONNECTED", statusClass: "starting" };
+    // Started, not yet connecting or loading (e.g. waiting for a download)
+    if (has("Idle"))
+      return { statusText: "INITIALIZING", statusClass: "starting" };
+
+    return { statusText: "RUNNING", statusClass: "active" };
+  }
+
+  function getBytes(value: unknown): number {
+    if (typeof value === "number") return value;
+    if (value && typeof value === "object") {
+      const v = value as Record<string, unknown>;
+      if (typeof v.inBytes === "number") return v.inBytes;
+    }
+    return 0;
+  }
+
+  async function deleteInstance(instanceId: string) {
+    // Get the model ID of the instance being deleted before we delete it
+    const deletedInstanceModelId = getInstanceModelId(instanceData[instanceId]);
+    const shortName = getModelDisplayName(deletedInstanceModelId);
+    if (!confirm(`Stop ${shortName}? Downloaded files are kept.`)) return;
+    const wasSelected = selectedChatModel() === deletedInstanceModelId;
+
+    if (!(await requestInstanceDeletion(instanceId))) {
+      addToast({ type: "error", message: `Failed to stop ${shortName}` });
+    } else if (wasSelected) {
+      // If we deleted the currently selected model, switch to another available model
+      // Find another instance that isn't the one we just deleted
+      const remainingInstances = Object.entries(instanceData).filter(
+        ([id]) => id !== instanceId,
+      );
+      if (remainingInstances.length > 0) {
+        // Select the last instance (most recently added, since objects preserve insertion order)
+        const [, lastInstance] =
+          remainingInstances[remainingInstances.length - 1];
+        const newModelId = getInstanceModelId(lastInstance);
+        if (
+          newModelId &&
+          newModelId !== "Unknown" &&
+          newModelId !== "Unknown Model"
+        ) {
+          setSelectedChatModel(newModelId);
+        } else {
+          // Clear selection if no valid model found
+          setSelectedChatModel("");
+        }
+      } else {
+        // No more instances, clear the selection
+        setSelectedChatModel("");
+      }
+    }
+  }
+
+  // Stops a model: by its instance's id, or by its deployment's id while it
+  // has no instance (exo stops the deployment either way)
+  async function requestInstanceDeletion(instanceId: string): Promise<boolean> {
+    try {
+      const response = await fetch(`/instance/${instanceId}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!response.ok) {
+        console.error("Failed to delete instance:", response.status);
+      }
+      return response.ok;
+    } catch (error) {
+      console.error("Error deleting instance:", error);
+      return false;
+    }
+  }
+
+  // Load a held or waiting model now
+  async function resumeDeployment(deployment: Deployment) {
+    const shortName = getModelDisplayName(deployment.modelId);
+    try {
+      const response = await fetch(`/deployments/${deployment.id}/resume`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        addToast({
+          type: "error",
+          message: `Couldn't start ${shortName}: ${await readApiErrorMessage(response)}`,
+        });
+      }
+    } catch (error) {
+      addToast({
+        type: "error",
+        message: `Couldn't start ${shortName}: ${error}`,
+      });
+    }
+  }
+
+  async function stopDeployment(deployment: Deployment) {
+    const shortName = getModelDisplayName(deployment.modelId);
+    if (!confirm(`Stop ${shortName}? Downloaded files are kept.`)) return;
+    if (!(await requestInstanceDeletion(deployment.id))) {
+      addToast({ type: "error", message: `Failed to stop ${shortName}` });
+    }
+  }
+
+  // Helper to unwrap tagged unions like { MlxRingInstance: {...} }
+  function getTagged(obj: unknown): [string | null, unknown] {
+    if (!obj || typeof obj !== "object") return [null, null];
+    const keys = Object.keys(obj as Record<string, unknown>);
+    if (keys.length === 1) {
+      return [keys[0], (obj as Record<string, unknown>)[keys[0]]];
+    }
+    return [null, null];
+  }
+
+  // What people call a model: its base model ("Llama 3.2 1B"), or the end of
+  // its repo id when the catalogue doesn't name it. The repo id stays in
+  // tooltips and details.
+  function getModelDisplayName(modelId: string): string {
+    const model = models.find((m) => m.id === modelId);
+    return model?.base_model || modelId.split("/").pop() || modelId;
+  }
+
+  function getModelQuantization(modelId: string): string | null {
+    return models.find((m) => m.id === modelId)?.quantization || null;
+  }
+
+  // Get model ID from an instance
+  function getInstanceModelId(instanceWrapped: unknown): string {
+    const [, instance] = getTagged(instanceWrapped);
+    if (!instance || typeof instance !== "object") return "Unknown";
+    const inst = instance as { shardAssignments?: { modelId?: string } };
+    return inst.shardAssignments?.modelId || "Unknown Model";
+  }
+
+  // Get instance details: connection label, sharding (Pipeline/Tensor), and node names
+  function getInstanceInfo(instanceWrapped: unknown): {
+    instanceType: string;
+    sharding: string;
+    nodeNames: string[];
+    nodeIds: string[];
+    nodeCount: number;
+  } {
+    const [instanceTag, instance] = getTagged(instanceWrapped);
+    if (!instance || typeof instance !== "object") {
+      return {
+        instanceType: "Unknown",
+        sharding: "Unknown",
+        nodeNames: [],
+        nodeIds: [],
+        nodeCount: 0,
+      };
+    }
+
+    // Connection type from tag, with the same labels as the launch panel
+    let instanceType = "Unknown";
+    if (instanceTag === "MlxRingInstance")
+      instanceType = RUNTIME_LABELS.MlxRing;
+    else if (instanceTag === "MlxJacclInstance")
+      instanceType = RUNTIME_LABELS.MlxJaccl;
+
+    const inst = instance as {
+      shardAssignments?: {
+        nodeToRunner?: Record<string, string>;
+        runnerToShard?: Record<string, unknown>;
+      };
+    };
+
+    // Sharding strategy from first shard
+    let sharding = "Unknown";
+    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
+    const firstShardWrapped = Object.values(runnerToShard)[0];
+    if (firstShardWrapped) {
+      const [shardTag] = getTagged(firstShardWrapped);
+      if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
+      else if (shardTag === "TensorShardMetadata") sharding = "Tensor";
+      else if (shardTag === "PrefillDecodeShardMetadata")
+        sharding = "Prefill/Decode";
+    }
+
+    // Node names from topology
+    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
+    const nodeIds = Object.keys(nodeToRunner);
+    const nodeNames = nodeIds.map((nodeId) => {
+      const node = data?.nodes?.[nodeId];
+      return node?.friendly_name || nodeId.slice(0, 8);
+    });
+
+    return {
+      instanceType,
+      sharding,
+      nodeNames,
+      nodeIds,
+      nodeCount: nodeIds.length,
+    };
+  }
+
+  // Compute instance statuses by modelId for the model picker
+  const modelInstanceStatuses = $derived.by(() => {
+    const result: Record<string, { status: string; statusClass: string }> = {};
+    for (const [id, inst] of Object.entries(instanceData)) {
+      const modelId = getInstanceModelId(inst);
+      if (!modelId || modelId === "Unknown" || modelId === "Unknown Model")
+        continue;
+      const dlStatus = getInstanceDownloadStatus(id, inst);
+      const statusText = dlStatus.statusText;
+      let statusClass = "inactive";
+      if (
+        statusText === "READY" ||
+        statusText === "RUNNING" ||
+        statusText === "LOADED"
+      ) {
+        statusClass = "ready";
+      } else if (statusText === "DOWNLOADING") {
+        statusClass = "downloading";
+      } else if (statusText === "LOADING" || statusText === "WARMING UP") {
+        statusClass = "loading";
+      }
+      // Keep the best status per modelId (ready > loading > downloading > other)
+      const existing = result[modelId];
+      if (existing) {
+        const rank = (c: string) =>
+          c === "ready" ? 3 : c === "loading" ? 2 : c === "downloading" ? 1 : 0;
+        if (rank(statusClass) <= rank(existing.statusClass)) continue;
+      }
+      result[modelId] = { status: statusText, statusClass };
+    }
+    return result;
+  });
+
+  function formatLastUpdate(): string {
+    if (!update) return "ACQUIRING...";
+    const seconds = Math.floor((Date.now() - update) / 1000);
+    if (seconds < 5) return "LIVE";
+    return `${seconds}s AGO`;
+  }
+
+  function formatBytes(bytes: number, decimals = 2): string {
+    if (!bytes || bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return (
+      parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + " " + sizes[i]
+    );
+  }
+
+  function formatSpeed(bps: number): string {
+    if (!bps || bps <= 0) return "0 B/s";
+    return formatBytes(bps, 1) + "/s";
+  }
+
+  function getNodeLabel(nodeId: string): string {
+    const node = data?.nodes?.[nodeId];
+    return node?.friendly_name || nodeId.slice(0, 8);
+  }
+
+  function getInterfaceLabel(
+    nodeId: string,
+    ip?: string,
+  ): { label: string; missing: boolean } {
+    if (!ip) return { label: "?", missing: true };
+    const node = data?.nodes?.[nodeId];
+    if (!node) return { label: "?", missing: true };
+
+    // Prefer explicit network_interfaces from NodePerformanceProfile
+    const matchFromInterfaces = node.network_interfaces?.find((iface) =>
+      (iface.addresses || []).some((addr) => addr === ip),
+    );
+    if (matchFromInterfaces?.name) {
+      return {
+        label: `${matchFromInterfaces.name} on ${getNodeLabel(nodeId)}`,
+        missing: false,
+      };
+    }
+
+    // Fallback to derived ip_to_interface map
+    const mapped = node.ip_to_interface?.[ip];
+    if (mapped && mapped.trim().length > 0) {
+      return { label: `${mapped} on ${getNodeLabel(nodeId)}`, missing: false };
+    }
+
+    return { label: "?", missing: true };
+  }
+
+  function getOrderedRunnerNodes(
+    instance: Record<string, unknown>,
+    shardType: "Pipeline" | "Tensor",
+  ) {
+    const runnerToShard =
+      (
+        instance.shardAssignments as
+          | { runnerToShard?: Record<string, unknown> }
+          | undefined
+      )?.runnerToShard || {};
+    const nodeToRunner =
+      (
+        instance.shardAssignments as
+          | { nodeToRunner?: Record<string, string> }
+          | undefined
+      )?.nodeToRunner || {};
+    const runnerEntries = Object.entries(runnerToShard).map(
+      ([runnerId, shardWrapped]) => {
+        const [tag, shard] = getTagged(shardWrapped);
+        const meta = shard as
+          | {
+              modelMeta?: {
+                worldSize?: number;
+                nLayers?: number;
+                deviceRank?: number;
+              };
+            }
+          | undefined;
+        const deviceRank = meta?.modelMeta?.deviceRank ?? 0;
+        return { runnerId, tag, deviceRank };
+      },
+    );
+
+    const ordered = runnerEntries
+      .filter((r) =>
+        shardType === "Pipeline"
+          ? r.tag === "PipelineShardMetadata"
+          : r.tag === "TensorShardMetadata",
+      )
+      .sort((a, b) => a.deviceRank - b.deviceRank)
+      .map((r, idx) => {
+        const nodeId = Object.entries(nodeToRunner).find(
+          ([, rid]) => rid === r.runnerId,
+        )?.[0];
+        return { nodeId, runnerId: r.runnerId, order: idx };
+      })
+      .filter((item) => item.nodeId);
+
+    return ordered as Array<{
+      nodeId: string;
+      runnerId: string;
+      order: number;
+    }>;
+  }
+
+  function pickHost(
+    hosts?: Array<{ ip: string; port: number }>,
+  ): { ip: string; port: number } | null {
+    if (!hosts || hosts.length === 0) return null;
+    const scored = hosts
+      .filter((h) => h.ip && h.ip !== "0.0.0.0" && h.port && h.port > 0)
+      .map((h) => {
+        const ip = h.ip;
+        const score =
+          ip.startsWith("10.") ||
+          ip.startsWith("172.") ||
+          ip.startsWith("192.168")
+            ? 3
+            : ip.startsWith("169.254")
+              ? 2
+              : 1;
+        return { host: h, score };
+      });
+    if (scored.length === 0) return null;
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].host;
+  }
+
+  function getInstanceConnections(instanceWrapped: unknown): Array<{
+    from: string;
+    to: string;
+    ip: string;
+    ifaceLabel: string;
+    missingIface: boolean;
+  }> {
+    const [instanceTag, instance] = getTagged(instanceWrapped);
+    if (!instance || typeof instance !== "object") return [];
+
+    // Jaccl (RDMA) – show RDMA interfaces from ibvDevices
+    if (instanceTag === "MlxJacclInstance") {
+      const ordered = getOrderedRunnerNodes(
+        instance as Record<string, unknown>,
+        "Tensor",
+      );
+      const ibvDevices =
+        (instance as { ibvDevices?: Array<Array<string | null>> }).ibvDevices ||
+        [];
+      const rows: Array<{
+        from: string;
+        to: string;
+        ip: string;
+        ifaceLabel: string;
+        missingIface: boolean;
+      }> = [];
+
+      for (let i = 0; i < ordered.length; i++) {
+        for (let j = i + 1; j < ordered.length; j++) {
+          const iface = ibvDevices[i]?.[j] ?? ibvDevices[j]?.[i] ?? null;
+          if (!iface) continue;
+          const fromId = ordered[i].nodeId;
+          const toId = ordered[j].nodeId;
+          rows.push({
+            from: getNodeLabel(fromId),
+            to: getNodeLabel(toId),
+            ip: iface,
+            ifaceLabel: `RDMA ${iface}`,
+            missingIface: false,
+          });
+        }
+      }
+      return rows;
+    }
+
+    // Ring – derive ring order from pipeline shard ranks and pick host IPs from hostsByNode
+    if (instanceTag === "MlxRingInstance") {
+      const ordered = getOrderedRunnerNodes(
+        instance as Record<string, unknown>,
+        "Pipeline",
+      );
+      const hostsByNode =
+        (
+          instance as {
+            hostsByNode?: Record<string, Array<{ ip: string; port: number }>>;
+          }
+        ).hostsByNode || {};
+      const rows: Array<{
+        from: string;
+        to: string;
+        ip: string;
+        ifaceLabel: string;
+        missingIface: boolean;
+      }> = [];
+      if (ordered.length === 0) return rows;
+
+      for (let idx = 0; idx < ordered.length; idx++) {
+        const current = ordered[idx];
+        const next = ordered[(idx + 1) % ordered.length];
+        const host = pickHost(hostsByNode[next.nodeId]);
+        const ip = host ? `${host.ip}:${host.port}` : "?";
+        const ifaceInfo = host
+          ? getInterfaceLabel(next.nodeId, host.ip)
+          : { label: "?", missing: true };
+        rows.push({
+          from: getNodeLabel(current.nodeId),
+          to: getNodeLabel(next.nodeId),
+          ip,
+          ifaceLabel: ifaceInfo.label,
+          missingIface: ifaceInfo.missing,
+        });
+      }
+      return rows;
+    }
+
+    return [];
+  }
+
+  // A download's speed, or that it's stuck
+  function downloadSpeedText(progress: DownloadProgress | null | undefined) {
+    if (progress?.stalled) return "Stalled";
+    return formatSpeed(progress?.speed ?? 0);
+  }
+
+  // A device's speed and time left; a stalled one has no time left to show
+  function nodeDownloadText(progress: DownloadProgress | null | undefined) {
+    if (progress?.stalled) return progress.stalledText ?? "Stalled";
+    return `${formatSpeed(progress?.speed ?? 0)} • ETA ${downloadEtaText(progress)}`;
+  }
+
+  // Time left, or "unknown": stalled, just started, or a device not moving
+  function downloadEtaText(progress: DownloadProgress | null | undefined) {
+    return progress && progress.etaMs > 0
+      ? formatEta(progress.etaMs)
+      : "unknown";
+  }
+
+  function formatEta(ms: number): string {
+    if (!ms || ms <= 0) return "--";
+    const totalSeconds = Math.round(ms / 1000);
+    const s = totalSeconds % 60;
+    const m = Math.floor(totalSeconds / 60) % 60;
+    const h = Math.floor(totalSeconds / 3600);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function handleNewChat() {
+    chatLaunchState = "idle";
+    pendingChatModelId = null;
+    selectedChatCategory = null;
+    returnQueuedMessageToInput();
+    userForcedIdle = true;
+    setSelectedChatModel("");
+    createConversation();
+  }
+
+  function handleGoHome() {
+    chatLaunchState = "idle";
+    pendingChatModelId = null;
+    selectedChatCategory = null;
+    returnQueuedMessageToInput();
+    userForcedIdle = true;
+    // Restore chat model from the sidebar preview selection so both selectors stay in sync
+    setSelectedChatModel(selectedModelId ?? "");
+    clearChat();
+  }
+
+  // Slider drag handlers
+  function handleSliderDrag(clientX: number) {
+    if (!sliderTrackElement || availableMinNodes <= 1) return;
+
+    const rect = sliderTrackElement.getBoundingClientRect();
+    const percentage = Math.max(
+      0,
+      Math.min(1, (clientX - rect.left) / rect.width),
+    );
+    const rawValue = Math.round(percentage * (availableMinNodes - 1)) + 1;
+    const clampedValue = Math.max(1, Math.min(availableMinNodes, rawValue));
+
+    // Find nearest valid value
+    const validCounts = validMinNodeCounts();
+    if (validCounts.has(clampedValue)) {
+      selectedMinNodes = clampedValue;
+    } else {
+      // Find nearest valid value
+      let nearest = clampedValue;
+      let minDist = Infinity;
+      for (const v of validCounts) {
+        const dist = Math.abs(v - clampedValue);
+        if (dist < minDist) {
+          minDist = dist;
+          nearest = v;
+        }
+      }
+      if (validCounts.size > 0) {
+        selectedMinNodes = nearest;
+      }
+    }
+  }
+
+  function handleSliderMouseDown(event: MouseEvent) {
+    isDraggingSlider = true;
+    handleSliderDrag(event.clientX);
+  }
+
+  function handleSliderMouseMove(event: MouseEvent) {
+    if (isDraggingSlider) {
+      handleSliderDrag(event.clientX);
+    }
+  }
+
+  function handleSliderMouseUp() {
+    isDraggingSlider = false;
+    saveLaunchDefaults();
+  }
+
+  // Handle touch events for mobile
+  function handleSliderTouchStart(event: TouchEvent) {
+    isDraggingSlider = true;
+    if (event.touches.length > 0) {
+      handleSliderDrag(event.touches[0].clientX);
+    }
+  }
+
+  function handleSliderTouchMove(event: TouchEvent) {
+    if (isDraggingSlider && event.touches.length > 0) {
+      event.preventDefault();
+      handleSliderDrag(event.touches[0].clientX);
+    }
+  }
+
+  function handleSliderTouchEnd() {
+    isDraggingSlider = false;
+    saveLaunchDefaults();
+  }
+
+  const nodeCount = $derived(data ? Object.keys(data.nodes).length : 0);
+  // Devices still in the cluster that stopped reporting, until it removes them
+  const notRespondingCount = $derived(
+    Object.keys(data?.nodes ?? {}).filter((nodeId) => {
+      const heardAt = heardAtData[nodeId];
+      return heardAt !== undefined && Date.now() - heardAt >= DEVICE_SILENCE_MS;
+    }).length,
+  );
+  const instanceCount = $derived(Object.keys(instanceData).length);
+
+  // ── "Add a device" hint ──
+  // A device that stays alone usually means the other Mac isn't running EXO,
+  // is on another network, or runs another EXO version (devices only find
+  // each other on the same version). Wait a while first: peers can take a
+  // few seconds to show up after startup.
+  const ADD_DEVICE_HINT_DISMISSED_KEY = "exo-add-device-hint-dismissed";
+  const ADD_DEVICE_HINT_DELAY_MS = 30_000;
+  let addDeviceHintDismissed = $state(loadAddDeviceHintDismissed());
+  let aloneLongEnough = $state(false);
+
+  function loadAddDeviceHintDismissed(): boolean {
+    try {
+      return localStorage.getItem(ADD_DEVICE_HINT_DISMISSED_KEY) === "true";
+    } catch {
+      // Storage unavailable: show the hint
+      return false;
+    }
+  }
+
+  function dismissAddDeviceHint() {
+    addDeviceHintDismissed = true;
+    try {
+      localStorage.setItem(ADD_DEVICE_HINT_DISMISSED_KEY, "true");
+    } catch {
+      // Storage unavailable: hidden until the page reloads
+    }
+  }
+
+  // Restarts whenever the node count changes: the hint needs 30 s alone, and
+  // goes away as soon as a second device joins
+  $effect(() => {
+    aloneLongEnough = false;
+    if (nodeCount !== 1) return;
+    const timer = setTimeout(() => {
+      aloneLongEnough = true;
+    }, ADD_DEVICE_HINT_DELAY_MS);
+    return () => clearTimeout(timer);
+  });
+
+  const showAddDeviceHint = $derived(
+    aloneLongEnough &&
+      nodeCount === 1 &&
+      !addDeviceHintDismissed &&
+      !showOnboardingOverlay,
+  );
+
+  // ── Instance status transition toasts ──
+  // Track previous statuses so we can detect meaningful transitions and fire toasts.
+  let previousInstanceStatuses: Record<string, string> = {};
+  // Instances whose failure was already announced. The worker retries a failed
+  // runner several times, so the status flips in and out of FAILED; announce it
+  // once, until the model is ready to serve or the instance is gone.
+  const announcedFailures = new Set<string>();
+  // Failures seen but not announced yet. When one runner fails, the others of
+  // its instance fail too, as their connection to it breaks, and often report
+  // first: wait a little for the reason of the runner that failed on its own.
+  const pendingFailures = new Map<string, number>();
+  const FAILURE_REASON_WAIT_MS = 10_000;
+
+  $effect(() => {
+    const currentStatuses: Record<string, string> = {};
+    const failureReasons: Record<string, string | null> = {};
+    for (const [id, inst] of Object.entries(instanceData)) {
+      const dlStatus = getInstanceDownloadStatus(id, inst);
+      currentStatuses[id] = dlStatus.statusText;
+      failureReasons[id] = dlStatus.errorMessage;
+    }
+
+    const prev = previousInstanceStatuses;
+
+    // Only fire toasts if we had a previous snapshot (skip the very first poll)
+    if (Object.keys(prev).length > 0) {
+      for (const [id, currentStatus] of Object.entries(currentStatuses)) {
+        const prevStatus = prev[id];
+        if (!prevStatus || prevStatus === currentStatus) continue;
+
+        const modelId = getInstanceModelId(instanceData[id]);
+        const shortName = modelId
+          ? getModelDisplayName(modelId)
+          : id.slice(0, 8);
+
+        // Downloading -> non-downloading, non-failure = download complete
+        if (
+          prevStatus === "DOWNLOADING" &&
+          currentStatus !== "DOWNLOADING" &&
+          currentStatus !== "FAILED"
+        ) {
+          addToast({
+            type: "success",
+            message: `${shortName} downloaded`,
+          });
+        }
+
+        // Loading/Warming Up -> Ready/Loaded/Running = model ready
+        if (
+          (prevStatus === "LOADING" || prevStatus === "WARMING UP") &&
+          (currentStatus === "READY" ||
+            currentStatus === "LOADED" ||
+            currentStatus === "RUNNING")
+        ) {
+          addToast({ type: "success", message: `${shortName} is ready` });
+        }
+
+        if (currentStatus === "READY" || currentStatus === "RUNNING") {
+          announcedFailures.delete(id);
+          pendingFailures.delete(id);
+        }
+
+        // Any -> Failed: announced below, once its reason is in
+        if (
+          prevStatus !== "FAILED" &&
+          currentStatus === "FAILED" &&
+          !announcedFailures.has(id) &&
+          !pendingFailures.has(id)
+        ) {
+          pendingFailures.set(id, Date.now());
+        }
+
+        // Any -> Shutdown
+        if (prevStatus !== "SHUTDOWN" && currentStatus === "SHUTDOWN") {
+          addToast({ type: "info", message: `${shortName} stopped` });
+        }
+      }
+
+      for (const [id, failedAt] of pendingFailures) {
+        // Between retries the reason isn't shown: wait for the next failure
+        if (currentStatuses[id] !== "FAILED") continue;
+        if (
+          !isFailureExplained(instanceData[id]) &&
+          Date.now() - failedAt < FAILURE_REASON_WAIT_MS
+        )
+          continue;
+        pendingFailures.delete(id);
+        announcedFailures.add(id);
+        const modelId = getInstanceModelId(instanceData[id]);
+        const shortName = modelId
+          ? (modelId.split("/").pop() ?? modelId)
+          : id.slice(0, 8);
+        // One readable line; the instance card's tooltip has the full text
+        const failure = failureReasons[id];
+        const reason = failure ? summarizeFailureReason(failure) : undefined;
+        addToast({
+          type: "error",
+          message: reason
+            ? `${shortName} failed: ${reason}`
+            : `${shortName} failed`,
+        });
+      }
+    }
+
+    for (const id of announcedFailures) {
+      if (!(id in currentStatuses)) announcedFailures.delete(id);
+    }
+    for (const id of pendingFailures.keys()) {
+      if (!(id in currentStatuses)) pendingFailures.delete(id);
+    }
+    previousInstanceStatuses = currentStatuses;
+  });
+
+  let lastNodeIdRefresh = 0;
+  function refreshLocalNodeId() {
+    lastNodeIdRefresh = Date.now();
+    fetch("/node_id")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((id) => {
+        if (typeof id !== "string" || !id) return;
+        localNodeId = id;
+      })
+      .catch(() => {});
+  }
+
+  // exo restarted on this device: it has a new id, and the old one leaves
+  // the cluster
+  $effect(() => {
+    if (!data || !localNodeId || data.nodes[localNodeId]) return;
+    if (Date.now() - lastNodeIdRefresh < 5_000) return;
+    refreshLocalNodeId();
+  });
+
+  // A lost connection to EXO is shown once, by ConnectionBanner (in the
+  // layout, so on every page); no toast as well
+
+  const suggestedPrompts = [
+    "Write a poem about the ocean",
+    "Explain quantum computing simply",
+    "Help me debug my code",
+    "Tell me a creative story",
+  ];
+
+  // ── Seamless chat: launch models from chat view ──
+  type InFlightChatLaunchState = "launching" | "downloading" | "loading";
+  type ReadyLikeChatLaunchState = "idle" | "ready";
+  type ChatLaunchState = InFlightChatLaunchState | ReadyLikeChatLaunchState;
+
+  let chatLaunchState = $state<ChatLaunchState>("idle");
+  let pendingChatModelId = $state<string | null>(null);
+  let selectedChatCategory = $state<string | null>(null);
+  // Guard: when true, the restore $effect must not override chatLaunchState.
+  // Set by handleNewChat/handleGoHome; cleared when the user picks a model.
+  let userForcedIdle = $state(false);
+
+  // Restore chat launch state when switching conversations
+  $effect(() => {
+    const currentModel = selectedChatModel();
+    // When the user explicitly requested the model selector (New Chat / Go Home),
+    // skip restoring state so the selector stays visible.
+    if (userForcedIdle) return;
+    if (!currentModel) {
+      if (chatStarted && chatLaunchState !== "idle") {
+        chatLaunchState = "idle";
+        pendingChatModelId = null;
+        selectedChatCategory = null;
+      }
+      return;
+    }
+
+    // Model is already running — no progress to show
+    if (hasRunningInstance(currentModel)) {
+      if (chatLaunchState !== "ready") {
+        chatLaunchState = "ready";
+      }
+      pendingChatModelId = currentModel;
+      return;
+    }
+
+    // Model is downloading
+    const dlStatus = getModelDownloadStatus(currentModel);
+    if (dlStatus.isDownloading) {
+      chatLaunchState = "downloading";
+      pendingChatModelId = currentModel;
+      return;
+    }
+
+    // Model is loading or in another pre-ready state
+    for (const [, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== currentModel) continue;
+      const status = deriveInstanceStatus(inst);
+      if (status.statusText === "LOADING") {
+        chatLaunchState = "loading";
+        pendingChatModelId = currentModel;
+        return;
+      }
+      if (
+        status.statusText === "WARMING UP" ||
+        status.statusText === "CONNECTED" ||
+        status.statusText === "CONNECTING" ||
+        status.statusText === "INITIALIZING" ||
+        status.statusText === "PREPARING"
+      ) {
+        chatLaunchState = "launching";
+        pendingChatModelId = currentModel;
+        return;
+      }
+    }
+
+    // Fallthrough: model exists but has no active instance/download/loading state
+    chatLaunchState = "idle";
+    pendingChatModelId = null;
+    selectedChatCategory = null;
+  });
+
+  // Suggested prompts per category
+  const categorySuggestedPrompts: Record<string, string[]> = {
+    coding: [
+      "Write a Snake game in Python",
+      "Build a REST API with FastAPI",
+      "Explain how async/await works",
+      "Help me write unit tests for my code",
+    ],
+    writing: [
+      "Write a short story about time travel",
+      "Draft a professional email to a client",
+      "Create a haiku about the ocean",
+      "Summarize the key ideas of stoicism",
+    ],
+    agentic: [
+      "Plan a weekend trip to Tokyo",
+      "Research and compare React vs Svelte",
+      "Create a step-by-step guide to learn ML",
+      "Analyze the pros and cons of remote work",
+    ],
+    biggest: [
+      "Explain quantum computing simply",
+      "Help me brainstorm startup ideas",
+      "What are the key differences between TCP and UDP?",
+      "Write a Python script to analyze a CSV file",
+    ],
+    auto: [
+      "Explain quantum computing simply",
+      "Help me brainstorm ideas for a side project",
+      "Write a Python function to sort a list",
+      "What makes a great technical interview?",
+    ],
+  };
+
+  // Cluster label for ChatModelSelector header
+  const chatClusterLabel = $derived.by(() => {
+    if (!data) return "your Mac";
+    const nodes = Object.values(data.nodes);
+    if (nodes.length === 0) return "your Mac";
+    if (nodes.length === 1) {
+      const node = nodes[0];
+      const name = node.system_info?.model_id || "your Mac";
+      const totalMem =
+        node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
+      const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
+      return `${name} ${memGB}GB`;
+    }
+    const totalMemGB = Math.round(clusterTotalMemoryGB());
+    return `cluster ${totalMemGB}GB`;
+  });
+
+  // Check if a model already has a running instance
+  function hasRunningInstance(modelId: string): boolean {
+    for (const [, inst] of Object.entries(instanceData)) {
+      const id = getInstanceModelId(inst);
+      if (id === modelId) {
+        const status = deriveInstanceStatus(inst);
+        if (
+          status.statusText === "READY" ||
+          status.statusText === "LOADED" ||
+          status.statusText === "RUNNING"
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function hasExistingInstance(modelId: string): boolean {
+    for (const [, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) === modelId) return true;
+    }
+    return false;
+  }
+
+  // Home screen chat input. Sending a message with a model selected that isn't
+  // running launches it (downloading it first if needed), so say that instead
+  // of asking the user to pick a model they already picked.
+  const homeChatPlaceholder = $derived(
+    selectedChatModel() ? "Ask anything" : "Choose a model to start chatting",
+  );
+  const homeChatHint = $derived.by((): string | null => {
+    const modelId = selectedChatModel();
+    if (!modelId) {
+      return instanceCount === 0 ? "Select a model to get started." : null;
+    }
+    if (hasExistingInstance(modelId)) return null;
+    const name = getModelDisplayName(modelId);
+    const onDisk = getModelDownloadStatus(modelId).perNode.some(
+      (node) => node.status === "completed",
+    );
+    if (onDisk) return `Send a message to start ${name}.`;
+    const model = models.find((m) => m.id === modelId);
+    const sizeGB = model ? getModelSizeGB(model) : 0;
+    const size =
+      sizeGB > 0
+        ? ` (${sizeGB >= 1 ? sizeGB.toFixed(0) : sizeGB.toFixed(1)} GB)`
+        : "";
+    return `Send a message to download and start ${name}${size}.`;
+  });
+
+  // Pick optimal placement from previews (frontend logic)
+  // Rules: 1-node → Pipeline/Ring, multi-node with RDMA → Tensor/Jaccl (most nodes),
+  //         multi-node without RDMA → 1-node Pipeline/Ring
+  function pickOptimalPlacement(
+    previews: PlacementPreview[],
+  ): PlacementPreview | null {
+    const valid = previews.filter((p) => p.instance && !p.error);
+
+    // Check if any valid placement uses multiple nodes (indicates multi-node cluster)
+    const hasMultiNode = valid.some((p) => getPreviewNodeCount(p) > 1);
+
+    if (hasMultiNode) {
+      // Multi-node with RDMA: prefer Jaccl + Tensor with most nodes (fastest TPS)
+      const jacclTensor = valid
+        .filter(
+          (p) => p.instance_meta === "MlxJaccl" && p.sharding === "Tensor",
+        )
+        .sort((a, b) => getPreviewNodeCount(b) - getPreviewNodeCount(a));
+      if (jacclTensor.length > 0) return jacclTensor[0];
+
+      // Multi-node without RDMA: fall back to single-node Pipeline/Ring
+      const singlePipeline = valid.filter(
+        (p) =>
+          p.instance_meta === "MlxRing" &&
+          p.sharding === "Pipeline" &&
+          getPreviewNodeCount(p) === 1,
+      );
+      if (singlePipeline.length > 0) return singlePipeline[0];
+    }
+
+    // Single node (or final fallback): Pipeline/Ring with fewest nodes
+    const ringPipeline = valid
+      .filter((p) => p.instance_meta === "MlxRing" && p.sharding === "Pipeline")
+      .sort((a, b) => getPreviewNodeCount(a) - getPreviewNodeCount(b));
+    if (ringPipeline.length > 0) return ringPipeline[0];
+
+    // Last resort: any valid placement, fewest nodes
+    return (
+      valid.sort(
+        (a, b) => getPreviewNodeCount(a) - getPreviewNodeCount(b),
+      )[0] ?? null
+    );
+  }
+
+  // Launch a model for seamless chat
+  async function launchModelForChat(
+    modelId: string,
+    category: string,
+    skipCreate = false,
+  ): Promise<boolean> {
+    userForcedIdle = false;
+    pendingChatModelId = modelId;
+    selectedChatCategory = category;
+
+    // Check if already running — skip straight to chat
+    if (hasRunningInstance(modelId)) {
+      setSelectedChatModel(modelId);
+      if (!skipCreate) createConversation();
+      chatLaunchState = "ready";
+      return true;
+    }
+
+    // Already has an instance (downloading/loading) — attach to its progress
+    if (hasExistingInstance(modelId)) {
+      setSelectedChatModel(modelId);
+      pendingChatModelId = modelId;
+      if (!skipCreate) createConversation();
+      const dlStatus = getModelDownloadStatus(modelId);
+      if (dlStatus.isDownloading) {
+        chatLaunchState = "downloading";
+      } else {
+        chatLaunchState = "launching";
+      }
+      return true;
+    }
+
+    chatLaunchState = "launching";
+
+    try {
+      // Fetch placement previews
+      const res = await fetch(
+        `/instance/previews?model_id=${encodeURIComponent(modelId)}`,
+      );
+      if (!res.ok) {
+        addToast({
+          type: "error",
+          message: `Failed to get placements: ${await readApiErrorMessage(res)}`,
+        });
+        chatLaunchState = "idle";
+        return false;
+      }
+      const data: { previews: PlacementPreview[] } = await res.json();
+      const placement = pickOptimalPlacement(data.previews);
+      if (!placement) {
+        const reason = getPlacementFailureReason(data.previews, modelId);
+        addToast({
+          type: "error",
+          message: reason
+            ? `Can't start ${getModelDisplayName(modelId)}: ${reason}`
+            : "No valid placement found for this model",
+        });
+        chatLaunchState = "idle";
+        return false;
+      }
+
+      // Launch the instance
+      const launchRes = await fetch("/instance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance: placement.instance }),
+      });
+      if (!launchRes.ok) {
+        addToast({
+          type: "error",
+          message: `Couldn't start ${getModelDisplayName(modelId)}: ${await readApiErrorMessage(launchRes)}`,
+        });
+        chatLaunchState = "idle";
+        return false;
+      }
+
+      setSelectedChatModel(modelId);
+      recordRecentLaunch(modelId);
+      if (!skipCreate) createConversation();
+      chatLaunchState = "downloading";
+      return true;
+    } catch (error) {
+      addToast({ type: "error", message: `Network error: ${error}` });
+      chatLaunchState = "idle";
+      return false;
+    }
+  }
+
+  // Handle auto-send: user typed without selecting a model
+  async function handleAutoSend(
+    content: string,
+    files?: ChatUploadedFile[],
+    // Set when the user picked an alternative in the download prompt
+    chosenModelId?: string,
+  ) {
+    // Clear forced-idle so restore effect resumes normal operation
+    userForcedIdle = false;
+
+    // The running model the chat bar shows gets the message: the user didn't
+    // ask for a different one, so don't start (and maybe download) another
+    const runningModelId = bestRunningModelId;
+    if (runningModelId && !chosenModelId) {
+      setSelectedChatModel(runningModelId);
+      if (!chatStarted) createConversation();
+      routeMessage(content, files);
+      return;
+    }
+
+    // Find the best auto model that fits in available memory
+    const totalMem = availableMemoryGB();
+    const modelInfos = models.map((m) => ({
+      id: m.id,
+      name: m.name ?? "",
+      base_model: m.base_model ?? "",
+      storage_size_megabytes: m.storage_size_megabytes ?? 0,
+      capabilities: m.capabilities ?? [],
+      family: m.family ?? "",
+      quantization: m.quantization ?? "",
+    }));
+    const autoModel = chosenModelId
+      ? (modelInfos.find((m) => m.id === chosenModelId) ?? null)
+      : // Only models the devices have the disk space to download
+        pickAutoModel(
+          modelInfos.filter((m) => canDownloadModel(m)),
+          totalMem,
+        );
+
+    if (!autoModel) {
+      addToast({
+        type: "error",
+        message: chosenModelId
+          ? `${getModelDisplayName(chosenModelId)} is no longer available`
+          : "No model fits in your available memory",
+      });
+      restoreChatDraft(content, files);
+      return;
+    }
+
+    // Check if the chosen auto model is already running
+    if (hasRunningInstance(autoModel.id)) {
+      setSelectedChatModel(autoModel.id);
+      if (!chatStarted) createConversation();
+      routeMessage(content, files);
+      return;
+    }
+
+    // Already has an instance (downloading/loading) — attach to its progress
+    if (hasExistingInstance(autoModel.id)) {
+      selectedChatCategory = "auto";
+      setSelectedChatModel(autoModel.id);
+      pendingChatModelId = autoModel.id;
+      if (!chatStarted) createConversation();
+      queueMessage({ content, files, modelId: autoModel.id });
+      const dlStatus = getModelDownloadStatus(autoModel.id);
+      if (dlStatus.isDownloading) {
+        chatLaunchState = "downloading";
+      } else {
+        chatLaunchState = "launching";
+      }
+      return;
+    }
+
+    // Need to launch first, then send
+    selectedChatCategory = "auto";
+    pendingChatModelId = autoModel.id;
+    chatLaunchState = "launching";
+    // Until the message is queued or handed on, give it back to the input
+    let handled = false;
+
+    try {
+      const res = await fetch(
+        `/instance/previews?model_id=${encodeURIComponent(autoModel.id)}`,
+      );
+      if (!res.ok) {
+        addToast({
+          type: "error",
+          message: `Failed to get placements: ${await readApiErrorMessage(res)}`,
+        });
+        chatLaunchState = "idle";
+        return;
+      }
+      const data: { previews: PlacementPreview[] } = await res.json();
+      // Prefer a placement on devices that already have the model
+      let placement =
+        pickOptimalPlacement(
+          data.previews.filter((p) => isPlacementDownloaded(autoModel.id, p)),
+        ) ?? pickOptimalPlacement(data.previews);
+      if (!placement) {
+        const reason = getPlacementFailureReason(data.previews, autoModel.id);
+        addToast({
+          type: "error",
+          message: reason
+            ? `Can't start ${getModelDisplayName(autoModel.id)}: ${reason}`
+            : "No valid placement found",
+        });
+        chatLaunchState = "idle";
+        return;
+      }
+
+      // Ask before starting a download the user didn't choose, offering the
+      // running model or the best downloaded one instead
+      if (!isPlacementDownloaded(autoModel.id, placement)) {
+        const alternativeId =
+          runningModelId ??
+          pickAutoModel(
+            modelInfos.filter(
+              (m) =>
+                m.id !== autoModel.id &&
+                getNodesWithModelDownloaded(downloadsData, m.id).length > 0,
+            ),
+            totalMem,
+          )?.id ??
+          null;
+        const choice = await askDownloadChoice(
+          autoModel.id,
+          alternativeId,
+          alternativeId !== null && alternativeId === runningModelId,
+        );
+        if (choice === "cancel") {
+          chatLaunchState = "idle";
+          return;
+        }
+        if (choice === "alternative" && alternativeId) {
+          handled = true;
+          selectedChatCategory = null;
+          chatLaunchState = "idle";
+          await handleAutoSend(content, files, alternativeId);
+          return;
+        }
+        // The prompt may have been open a while: place with fresh previews
+        const freshRes = await fetch(
+          `/instance/previews?model_id=${encodeURIComponent(autoModel.id)}`,
+        );
+        const freshPreviews: PlacementPreview[] = freshRes.ok
+          ? ((await freshRes.json()) as { previews: PlacementPreview[] })
+              .previews
+          : [];
+        placement =
+          pickOptimalPlacement(
+            freshPreviews.filter((p) => isPlacementDownloaded(autoModel.id, p)),
+          ) ??
+          pickOptimalPlacement(freshPreviews) ??
+          placement;
+      }
+
+      const launchRes = await fetch("/instance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance: placement.instance }),
+      });
+      if (!launchRes.ok) {
+        addToast({
+          type: "error",
+          message: `Couldn't start ${getModelDisplayName(autoModel.id)}: ${await readApiErrorMessage(launchRes)}`,
+        });
+        chatLaunchState = "idle";
+        return;
+      }
+
+      setSelectedChatModel(autoModel.id);
+      recordRecentLaunch(autoModel.id);
+      if (!chatStarted) createConversation();
+      chatLaunchState = "downloading";
+
+      // Queue the message to send once model is ready
+      queueMessage({ content, files, modelId: autoModel.id });
+      handled = true;
+    } catch (error) {
+      addToast({ type: "error", message: `Network error: ${error}` });
+      chatLaunchState = "idle";
+    } finally {
+      if (!handled) restoreChatDraft(content, files);
+    }
+  }
+
+  // Whether a placement's devices all have the model on disk already
+  function isPlacementDownloaded(
+    modelId: string,
+    preview: PlacementPreview,
+  ): boolean {
+    const nodeIds = [...unwrapInstanceNodes(preview.instance)];
+    const downloadedOn = new Set(
+      getNodesWithModelDownloaded(downloadsData, modelId),
+    );
+    return (
+      nodeIds.length > 0 && nodeIds.every((nodeId) => downloadedOn.has(nodeId))
+    );
+  }
+
+  // ── Download confirmation for auto-picked models ──
+  type DownloadChoice = "download" | "alternative" | "cancel";
+  let downloadChoicePrompt = $state<{
+    modelName: string;
+    sizeLabel: string;
+    partlyDownloaded: boolean;
+    alternativeName: string | null;
+    alternativeRunning: boolean;
+    autoPicked: boolean;
+    resolve: (choice: DownloadChoice) => void;
+  } | null>(null);
+
+  function askDownloadChoice(
+    modelId: string,
+    alternativeId: string | null,
+    alternativeRunning: boolean,
+    // false when the user picked the model (e.g. a recommendation card)
+    autoPicked = true,
+  ): Promise<DownloadChoice> {
+    // Only one prompt at a time: an older one counts as cancelled
+    if (downloadChoicePrompt) answerDownloadChoice("cancel");
+    const model = models.find((m) => m.id === modelId);
+    const sizeGB = model ? getModelSizeGB(model) : 0;
+    // Furthest partial download of this model on any device
+    const partPercent = Math.max(
+      0,
+      ...getModelDownloadStatus(modelId)
+        .perNode.filter((node) => node.status !== "completed")
+        .map((node) => node.percentage),
+    );
+    const formatGB = (gb: number) =>
+      gb >= 10 ? `${Math.round(gb)}` : gb.toFixed(1);
+    const shortName = getModelDisplayName;
+    return new Promise((resolve) => {
+      downloadChoicePrompt = {
+        modelName: shortName(modelId),
+        sizeLabel:
+          partPercent > 0
+            ? `${formatGB(sizeGB * (1 - partPercent / 100))} of ${formatGB(sizeGB)} GB left`
+            : `${formatGB(sizeGB)} GB`,
+        partlyDownloaded: partPercent > 0,
+        alternativeName: alternativeId ? shortName(alternativeId) : null,
+        alternativeRunning,
+        autoPicked,
+        resolve,
+      };
+    });
+  }
+
+  // Open the prompt as a modal (the rest of the page is inert, so nothing
+  // can be typed behind it) and focus the safe choice: the alternative if
+  // there is one, otherwise Cancel
+  function showDownloadChoiceDialog(dialog: HTMLDialogElement) {
+    dialog.showModal();
+    dialog.querySelector<HTMLButtonElement>("[data-default-choice]")?.focus();
+  }
+
+  function answerDownloadChoice(choice: DownloadChoice) {
+    const prompt = downloadChoicePrompt;
+    downloadChoicePrompt = null;
+    prompt?.resolve(choice);
+  }
+
+  // Pending message to send after auto-launch completes, and the model it waits for
+  type PendingMessage = {
+    content: string;
+    modelId: string;
+    files?: ChatUploadedFile[];
+  };
+  let pendingAutoMessage = $state<PendingMessage | null>(null);
+
+  // Text and attachments in the chat input. Kept here (not in ChatForm) so
+  // they survive the chat view switching layouts, and so an unsent message
+  // can be put back.
+  let chatDraft = $state("");
+  let chatDraftFiles = $state<ChatUploadedFile[]>([]);
+
+  function restoreChatDraft(content: string, files: ChatUploadedFile[] = []) {
+    chatDraft = chatDraft.trim() ? `${content}\n\n${chatDraft}` : content;
+    if (files.length > 0) chatDraftFiles = [...files, ...chatDraftFiles];
+  }
+
+  // Queue a message to send once its model is ready. A message already
+  // queued for something else goes back to the input rather than being lost.
+  function queueMessage(message: PendingMessage) {
+    if (pendingAutoMessage && pendingAutoMessage.content !== message.content) {
+      returnQueuedMessageToInput();
+    }
+    pendingAutoMessage = message;
+  }
+
+  // Give a queued message back to the input instead of dropping it
+  function returnQueuedMessageToInput() {
+    const queued = pendingAutoMessage;
+    if (!queued) return;
+    pendingAutoMessage = null;
+    restoreChatDraft(queued.content, queued.files);
+  }
+
+  // The running model a message goes to when none is selected, shown in the
+  // chat bar: the most recently launched from this browser, else the best by
+  // the auto-pick tiers, else the biggest. Image models can't take a chat.
+  const bestRunningModelId = $derived.by(() => {
+    const candidates: {
+      id: string;
+      recentIndex: number;
+      tierIndex: number;
+      sizeMB: number;
+    }[] = [];
+    for (const [, inst] of Object.entries(instanceData)) {
+      const modelId = getInstanceModelId(inst);
+      if (modelId === "Unknown" || modelId === "Unknown Model") continue;
+      if (candidates.some((candidate) => candidate.id === modelId)) continue;
+      if (!hasRunningInstance(modelId)) continue;
+      if (modelSupportsImageGeneration(modelId)) continue;
+      const info = models.find((m) => m.id === modelId);
+      if (!info) continue;
+      const recentIndex = recentModelIds.indexOf(modelId);
+      candidates.push({
+        id: modelId,
+        recentIndex: recentIndex === -1 ? Infinity : recentIndex,
+        tierIndex: getAutoTierIndex(info.base_model ?? ""),
+        sizeMB: info.storage_size_megabytes ?? 0,
+      });
+    }
+    candidates.sort(
+      (a, b) =>
+        (a.recentIndex === b.recentIndex ? 0 : a.recentIndex - b.recentIndex) ||
+        a.tierIndex - b.tierIndex ||
+        b.sizeMB - a.sizeMB,
+    );
+    return candidates[0]?.id ?? null;
+  });
+
+  // Track chat launch progress (download + loading)
+  const chatLaunchDownload = $derived.by(() => {
+    if (
+      !pendingChatModelId ||
+      (chatLaunchState !== "downloading" && chatLaunchState !== "launching")
+    )
+      return null;
+    const status = getModelDownloadStatus(pendingChatModelId);
+    if (status.isDownloading) return status.progress;
+    return null;
+  });
+
+  const chatLaunchLoadProgress = $derived.by(() => {
+    if (
+      !pendingChatModelId ||
+      chatLaunchState === "idle" ||
+      chatLaunchState === "ready"
+    )
+      return null;
+    let layersLoaded = 0,
+      totalLayers = 0;
+    for (const [, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== pendingChatModelId) continue;
+      const status = deriveInstanceStatus(inst);
+      if (
+        status.statusText === "LOADING" &&
+        status.totalLayers &&
+        status.totalLayers > 0
+      ) {
+        layersLoaded += status.layersLoaded ?? 0;
+        totalLayers += status.totalLayers;
+      }
+    }
+    if (totalLayers === 0) return null;
+    return {
+      layersLoaded,
+      totalLayers,
+      percentage: (layersLoaded / totalLayers) * 100,
+    };
+  });
+
+  // Auto-advance chat launch state based on instance status
+  $effect(() => {
+    if (!pendingChatModelId || chatLaunchState === "idle") return;
+
+    // Check if model is now ready
+    if (hasRunningInstance(pendingChatModelId)) {
+      chatLaunchState = "ready";
+      // Send pending auto message if any (only to the model it was queued for)
+      if (pendingAutoMessage) {
+        if (pendingAutoMessage.modelId === pendingChatModelId) {
+          const msg = pendingAutoMessage;
+          pendingAutoMessage = null;
+          routeMessage(msg.content, msg.files);
+        } else {
+          returnQueuedMessageToInput();
+        }
+      }
+      return;
+    }
+
+    // If already ready (set by restore effect), don't downgrade state
+    if (chatLaunchState === "ready") return;
+
+    // Check if currently loading
+    if (chatLaunchLoadProgress) {
+      chatLaunchState = "loading";
+      return;
+    }
+
+    // Check if currently downloading
+    if (chatLaunchDownload) {
+      chatLaunchState = "downloading";
+    }
+  });
+
+  // Give a queued message back to the input if the model it waits for is
+  // removed, its download fails, or its runner keeps failing (the worker
+  // retries failed runners, so a single failure isn't final)
+  // Safety net: normally the worker removes the instance first (its retries
+  // take ~25-30 s when every attempt fails)
+  const QUEUED_MESSAGE_FAILED_GIVE_UP_MS = 45_000;
+  let queuedMessageWatch: {
+    message: PendingMessage | null;
+    instanceSeen: boolean;
+    failedSince: number | null;
+  } = { message: null, instanceSeen: false, failedSince: null };
+
+  $effect(() => {
+    const queued = pendingAutoMessage;
+    const instances = Object.entries(instanceData);
+    if (!queued) return;
+    if (queuedMessageWatch.message !== queued) {
+      queuedMessageWatch = {
+        message: queued,
+        instanceSeen: false,
+        failedSince: null,
+      };
+    }
+    const forModel = instances.filter(
+      ([, inst]) => getInstanceModelId(inst) === queued.modelId,
+    );
+    if (forModel.length === 0) {
+      if (queuedMessageWatch.instanceSeen) returnQueuedMessageToInput();
+      return;
+    }
+    queuedMessageWatch.instanceSeen = true;
+    const statuses = forModel.map(([id, inst]) => ({
+      failed: getInstanceDownloadStatus(id, inst).isFailed,
+      runnerFailed: deriveInstanceStatus(inst).statusText === "FAILED",
+    }));
+    if (!statuses.every((status) => status.failed)) {
+      queuedMessageWatch.failedSince = null;
+      return;
+    }
+    // Failed downloads aren't retried; failed runners are
+    if (statuses.some((status) => !status.runnerFailed)) {
+      returnQueuedMessageToInput();
+      return;
+    }
+    queuedMessageWatch.failedSince ??= Date.now();
+    if (
+      Date.now() - queuedMessageWatch.failedSince >=
+      QUEUED_MESSAGE_FAILED_GIVE_UP_MS
+    ) {
+      returnQueuedMessageToInput();
+    }
+  });
+
+  // Check if any instance is running (for showing model selector vs chat)
+  const hasAnyRunningInstance = $derived(() => {
+    for (const [, inst] of Object.entries(instanceData)) {
+      const status = deriveInstanceStatus(inst);
+      if (
+        status.statusText === "READY" ||
+        status.statusText === "LOADED" ||
+        status.statusText === "RUNNING"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  });
+
+  // Whether each model is running or on disk, for the New Chat
+  // recommendation cards
+  const chatModelStatus = $derived.by(() => {
+    const status: Record<string, "running" | "downloaded"> = {};
+    for (const model of models) {
+      if (hasRunningInstance(model.id)) status[model.id] = "running";
+      else if (getNodesWithModelDownloaded(downloadsData, model.id).length > 0)
+        status[model.id] = "downloaded";
+    }
+    return status;
+  });
+
+  // Downloads smaller than this start without asking
+  const CONFIRM_CARD_DOWNLOAD_ABOVE_GB = 1;
+
+  // Handle model selection from ChatModelSelector. A card launches its model
+  // in one click, so ask before that starts a large download, offering the
+  // running model (or the best downloaded one) instead.
+  async function handleChatModelSelect(modelId: string, category: string) {
+    const model = models.find((m) => m.id === modelId);
+    const needsDownload =
+      !hasExistingInstance(modelId) &&
+      getNodesWithModelDownloaded(downloadsData, modelId).length === 0 &&
+      (model ? getModelSizeGB(model) : 0) > CONFIRM_CARD_DOWNLOAD_ABOVE_GB;
+    if (needsDownload) {
+      const alternativeId =
+        bestRunningModelId ?? bestDownloadedModelId(modelId);
+      const choice = await askDownloadChoice(
+        modelId,
+        alternativeId,
+        alternativeId !== null && alternativeId === bestRunningModelId,
+        false,
+      );
+      if (choice === "cancel") return;
+      if (choice === "alternative" && alternativeId) {
+        launchModelForChat(alternativeId, category);
+        return;
+      }
+    }
+    launchModelForChat(modelId, category);
+  }
+
+  // Best model (by the auto-pick tiers) that's on disk and fits, other than
+  // excludeId
+  function bestDownloadedModelId(excludeId: string): string | null {
+    const downloaded = models
+      .filter(
+        (m) =>
+          m.id !== excludeId &&
+          getNodesWithModelDownloaded(downloadsData, m.id).length > 0,
+      )
+      .map((m) => ({
+        id: m.id,
+        name: m.name ?? "",
+        base_model: m.base_model ?? "",
+        storage_size_megabytes: m.storage_size_megabytes ?? 0,
+        capabilities: m.capabilities ?? [],
+        family: m.family ?? "",
+        quantization: m.quantization ?? "",
+      }));
+    return pickAutoModel(downloaded, availableMemoryGB())?.id ?? null;
+  }
+
+  // Handle "+ Add Model" from ChatModelSelector
+  function handleChatAddModel() {
+    modelPickerContext = "chat";
+    isModelPickerOpen = true;
+  }
+
+  // Track which context opened the model picker (dashboard launch vs chat selection)
+  let modelPickerContext = $state<"dashboard" | "chat">("dashboard");
+
+  // Open the model picker from a chat context (e.g. clicking the model button in ChatForm)
+  function openChatModelPicker() {
+    modelPickerContext = "chat";
+    isModelPickerOpen = true;
+  }
+
+  // Handle model selection from the picker when opened from chat context
+  function handleChatPickerSelect(modelId: string) {
+    setSelectedChatModel(modelId);
+    selectPreviewModel(modelId);
+    userForcedIdle = false;
+    isModelPickerOpen = false;
+  }
+
+  // Unified send handler: sends if model running, auto-launches if not
+  function handleChatSend(content: string, files?: ChatUploadedFile[]) {
+    const model = selectedChatModel();
+
+    // Model is selected and running — send directly
+    if (model && hasRunningInstance(model)) {
+      chatLaunchState = "ready";
+      routeMessage(content, files);
+      return;
+    }
+
+    // Model is selected but NOT running — launch it, queue the message
+    if (model) {
+      queueMessage({ content, files, modelId: model });
+      userForcedIdle = false;
+      // The selected model is already being placed or loaded; keep the queued
+      // message and let the existing launch state effects send it once ready.
+      if (
+        pendingChatModelId === model &&
+        chatLaunchState !== "idle" &&
+        chatLaunchState !== "ready"
+      ) {
+        return;
+      }
+      launchModelForChat(model, "picker", messages().length > 0).then(
+        (launched) => {
+          if (!launched && pendingAutoMessage?.modelId === model) {
+            returnQueuedMessageToInput();
+          }
+        },
+      );
+      return;
+    }
+
+    // No model selected — fall through to auto-pick
+    handleAutoSend(content, files);
+  }
+
+  // Helper to get the number of nodes in a placement preview
+  function getPreviewNodeCount(preview: PlacementPreview): number {
+    if (!preview.memory_delta_by_node) return 0;
+    // Count nodes that have non-zero memory delta (i.e. nodes actually used)
+    return Object.entries(preview.memory_delta_by_node).filter(
+      ([_, delta]) => delta > 0,
+    ).length;
+  }
+
+  // Available min nodes options based on topology (like old dashboard)
+  const availableMinNodes = $derived(Math.max(1, nodeCount));
+
+  // Compute which min node values have valid previews for the current model/sharding/instance type
+  // A minNodes value N is valid if there exists a placement with nodeCount >= N
+  // Note: previewsData already contains previews for the selected model (fetched via API)
+  const validMinNodeCounts = $derived(() => {
+    if (!selectedModelId || previewsData.length === 0) {
+      // If no model selected or no previews, allow all node counts (UI shows all as clickable)
+      return new Set(
+        Array.from({ length: availableMinNodes }, (_, i) => i + 1),
+      );
+    }
+
+    // Find the max node count among valid placements for this model/sharding/instance
+    // (model_id filter not needed since previewsData is already for selected model)
+    let maxValidNodes = 0;
+    for (const preview of previewsData) {
+      if (preview.sharding !== selectedSharding) continue;
+      if (!matchesSelectedRuntime(preview.instance_meta)) continue;
+      if (preview.error !== null) continue;
+      if (!preview.memory_delta_by_node) continue;
+
+      const previewNodes = getPreviewNodeCount(preview);
+      if (previewNodes > maxValidNodes) {
+        maxValidNodes = previewNodes;
+      }
+    }
+
+    // All values from 1 to maxValidNodes are valid (since there's a placement with >= that many nodes)
+    if (maxValidNodes === 0) return new Set<number>();
+    return new Set(Array.from({ length: maxValidNodes }, (_, i) => i + 1));
+  });
+
+  // Get ALL filtered previews based on current settings (matching minimum nodes)
+  // Note: previewsData already contains previews for the selected model (fetched via API)
+  // Backend handles node_ids filtering, we filter by sharding/instance type and min nodes
+  const filteredPreviews = $derived(() => {
+    if (!selectedModelId || previewsData.length === 0) return [];
+
+    // Find previews matching sharding/instance type (model_id filter not needed since previewsData is already for selected model)
+    const matchingPreviews = previewsData.filter(
+      (p: PlacementPreview) =>
+        p.sharding === selectedSharding &&
+        matchesSelectedRuntime(p.instance_meta) &&
+        p.error === null &&
+        p.memory_delta_by_node !== null,
+    );
+
+    // Filter to previews with node count >= selectedMinNodes, sorted by node count (ascending)
+    return matchingPreviews
+      .filter(
+        (p: PlacementPreview) => getPreviewNodeCount(p) >= selectedMinNodes,
+      )
+      .sort(
+        (a: PlacementPreview, b: PlacementPreview) =>
+          getPreviewNodeCount(a) - getPreviewNodeCount(b),
+      );
+  });
+
+  // Get the first filtered preview (for launch function compatibility)
+  const filteredPreview = $derived(() => filteredPreviews()[0] ?? null);
+
+  // When the selected model can't launch with the current settings: why, and
+  // the closest sharding/interconnect combination that would work
+  const placementMismatch = $derived.by(() => {
+    if (!selectedModelId || previewsData.length === 0) return null;
+    if (filteredPreviews().length > 0) return null;
+    const errored = previewsData.find(
+      (p) =>
+        p.sharding === selectedSharding &&
+        matchesSelectedRuntime(p.instance_meta) &&
+        p.error,
+    );
+    const otherSharding: "Pipeline" | "Tensor" =
+      selectedSharding === "Pipeline" ? "Tensor" : "Pipeline";
+    const otherRuntime: InstanceMeta =
+      selectedInstanceType === "MlxRing" ? "MlxJaccl" : "MlxRing";
+    const alternative =
+      [
+        { sharding: selectedSharding, runtime: otherRuntime },
+        { sharding: otherSharding, runtime: selectedInstanceType },
+        { sharding: otherSharding, runtime: otherRuntime },
+      ].find(({ sharding, runtime }) =>
+        previewsData.some(
+          (p) =>
+            p.sharding === sharding &&
+            p.instance_meta === runtime &&
+            p.error === null &&
+            p.memory_delta_by_node !== null,
+        ),
+      ) ?? null;
+    return {
+      // Previews are limited to the node filter when one is active
+      reason: errored?.error
+        ? describePlacementError(
+            errored.error,
+            selectedModelId,
+            isFilterActive(),
+          )
+        : null,
+      alternative,
+    };
+  });
+
+  function useLaunchSettings(
+    sharding: "Pipeline" | "Tensor",
+    runtime: InstanceMeta,
+  ) {
+    selectedSharding = sharding;
+    selectedInstanceType = runtime;
+    saveLaunchDefaults();
+  }
+
+  // Remembered non-default start settings, shown while Advanced Options is closed
+  const customLaunchSettingsLabel = $derived.by(() => {
+    if (
+      selectedSharding === "Pipeline" &&
+      selectedInstanceType === "MlxRing" &&
+      selectedMinNodes <= 1
+    )
+      return null;
+    const parts: string[] = [
+      selectedSharding,
+      RUNTIME_LABELS[selectedInstanceType],
+    ];
+    if (selectedMinNodes > 1) parts.push(`${selectedMinNodes}+ devices`);
+    return parts.join(" · ");
+  });
+
+  // Auto-update selectedMinNodes when node count changes (default to 1 = show all placements)
+  $effect(() => {
+    const maxNodes = availableMinNodes;
+    if (!minNodesInitialized && maxNodes > 0) {
+      // On initial load, default to 1 (minimum) to show all valid placements
+      selectedMinNodes = 1;
+      minNodesInitialized = true;
+    } else if (selectedMinNodes > maxNodes) {
+      // If current selection exceeds available nodes, cap it
+      selectedMinNodes = maxNodes;
+    }
+  });
+
+  // Auto-adjust selectedMinNodes to a valid value when it becomes invalid
+  $effect(() => {
+    const valid = validMinNodeCounts();
+    if (valid.size > 0 && !valid.has(selectedMinNodes)) {
+      // Find the smallest valid count >= current selection, or the largest valid count
+      const validArray = Array.from(valid).sort((a, b) => a - b);
+      const nextValid =
+        validArray.find((n) => n >= selectedMinNodes) ??
+        validArray[validArray.length - 1];
+      if (nextValid !== undefined) {
+        selectedMinNodes = nextValid;
+      }
+    }
+  });
+
+  // Calculate total memory usage across all nodes
+  const clusterMemory = $derived(() => {
+    if (!data) return { used: 0, total: 0 };
+    return Object.values(data.nodes).reduce(
+      (acc, n) => {
+        const total =
+          n.macmon_info?.memory?.ram_total ?? n.system_info?.memory ?? 0;
+        const used = n.macmon_info?.memory?.ram_usage ?? 0;
+        return { used: acc.used + used, total: acc.total + total };
+      },
+      { used: 0, total: 0 },
+    );
+  });
+</script>
+
+{#snippet deploymentCards()}
+  <!-- Models users launched that have no running instance: exo says what it is doing -->
+  {#each pendingDeployments as deployment (deployment.id)}
+    {@const phase = deployment.phase}
+    <div
+      class="relative"
+      data-testid="deployment-card"
+      transition:slide={{ duration: 250, easing: cubicOut }}
+    >
+      <div
+        class="bg-exo-dark-gray/60 border border-l-2 p-3 {phase.kind ===
+        'paused'
+          ? 'border-gray-500/30 border-l-gray-400'
+          : 'border-orange-500/30 border-l-orange-400'}"
+      >
+        <div class="flex justify-between items-start mb-2 pl-2 gap-2">
+          <span
+            class="text-exo-yellow font-mono text-sm truncate"
+            title={deployment.modelId}
+            >{getModelDisplayName(deployment.modelId)}</span
+          >
+          <div class="flex flex-shrink-0 gap-1">
+            {#if phase.kind === "paused" || (phase.kind === "waiting" && phase.canStartNow)}
+              <button
+                title={phase.kind === "paused"
+                  ? "Load this model again"
+                  : "Don't wait for the device: load it on the devices that are here"}
+                onclick={() => resumeDeployment(deployment)}
+                class="text-xs px-2 py-1 font-mono tracking-wider uppercase border border-exo-yellow/30 text-exo-yellow hover:bg-exo-yellow/10 transition-all duration-200 cursor-pointer"
+              >
+                {phase.kind === "paused" ? "Resume" : "Start now"}
+              </button>
+            {/if}
+            <button
+              title="Stop this model. Downloaded files are kept."
+              onclick={() => stopDeployment(deployment)}
+              class="text-xs px-2 py-1 font-mono tracking-wider uppercase border border-red-500/30 text-red-400 hover:bg-red-500/20 transition-all duration-200 cursor-pointer"
+            >
+              Stop
+            </button>
+          </div>
+        </div>
+        <div class="pl-2">
+          <span
+            class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded font-mono {phase.kind ===
+            'paused'
+              ? 'bg-gray-500/15 text-gray-300'
+              : 'bg-orange-500/15 text-orange-400'}"
+          >
+            {phase.kind === "restarting"
+              ? "Restarting"
+              : phase.kind === "waiting"
+                ? "Waiting"
+                : "Paused"}
+          </span>
+          {#if phase.kind === "waiting" || phase.kind === "paused"}
+            <p class="mt-1 text-[11px] text-white/60 break-words">
+              {phase.reason}
+            </p>
+          {/if}
+          {#if deployment.note}
+            <p class="mt-1 text-[11px] text-white/50 break-words">
+              {deployment.note}
+            </p>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/each}
+{/snippet}
+
+{#snippet clusterWarnings()}
+  {#if tbBridgeCycles.length > 0 || macosVersionMismatch || devicesOnOtherVersions.length > 0 || (tb5WithoutRdma && !tb5InfoDismissed) || (macStudioEn2RdmaWarning && !macStudioEn2Dismissed)}
+    <div class="absolute top-4 left-4 flex flex-col gap-2 z-40">
+      {#if tbBridgeCycles.length > 0}
+        {@const cycle = tbBridgeCycles[0]}
+        {@const serviceName = getTbBridgeServiceName(cycle)}
+        {@const disableCmd = `sudo networksetup -setnetworkserviceenabled "${serviceName}" off`}
+        <div class="group relative" role="alert">
+          <div
+            class="flex items-center gap-2 px-3 py-2 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm cursor-help"
+          >
+            <svg
+              class="w-5 h-5 text-yellow-400 flex-shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d={warningIconPath}
+              />
+            </svg>
+            <span class="text-sm font-mono text-yellow-200">
+              THUNDERBOLT BRIDGE LOOP DETECTED
+            </span>
+          </div>
+
+          <!-- Tooltip on hover -->
+          <div
+            class="absolute top-full left-0 mt-2 w-80 p-3 rounded border border-yellow-500/30 bg-exo-dark-gray/95 backdrop-blur-sm opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 shadow-lg"
+          >
+            <p class="text-xs text-white/80 mb-2">
+              A Thunderbolt Bridge loop was detected between devices connected
+              with Thunderbolt. This can cause connectivity issues.
+            </p>
+            <p class="text-xs text-white/60 mb-2">
+              <span class="text-yellow-300">Affected devices:</span>
+              {cycle.map(getNodeName).join(" → ")}
+            </p>
+            <p class="text-xs text-white/60 mb-1">
+              <span class="text-yellow-300">To fix:</span> Turn off Thunderbolt Bridge
+              on one of the affected devices:
+            </p>
+            <button
+              type="button"
+              onclick={() => copyToClipboard(disableCmd)}
+              class="w-full flex items-center gap-2 text-[10px] font-mono bg-exo-black/60 px-2 py-1.5 rounded text-exo-yellow break-all text-left hover:bg-exo-black/80 transition-colors cursor-pointer group/copy"
+              title="Click to copy"
+            >
+              <span class="flex-1">{disableCmd}</span>
+              <svg
+                class="w-3.5 h-3.5 flex-shrink-0 text-white/40 group-hover/copy:text-exo-yellow transition-colors"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                {#if copiedCommand}
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M5 13l4 4L19 7"
+                  />
+                {:else}
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                  />
+                {/if}
+              </svg>
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      {#if macosVersionMismatch}
+        <div class="group relative" role="alert">
+          <div
+            class="flex items-center gap-2 px-3 py-2 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm cursor-help"
+          >
+            <svg
+              class="w-5 h-5 text-yellow-400 flex-shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d={warningIconPath}
+              />
+            </svg>
+            <span class="text-sm font-mono text-yellow-200">
+              INCOMPATIBLE macOS VERSIONS
+            </span>
+          </div>
+
+          <!-- Tooltip on hover -->
+          <div
+            class="absolute top-full left-0 mt-2 w-80 p-3 rounded border border-yellow-500/30 bg-exo-dark-gray/95 backdrop-blur-sm opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 shadow-lg"
+          >
+            <p class="text-xs text-white/80 mb-2">
+              Devices in this cluster are running different macOS versions. This
+              may cause compatibility issues when running models.
+            </p>
+            <div class="text-xs text-white/60 mb-2">
+              <span class="text-yellow-300">macOS versions:</span>
+              {#each macosVersionMismatch as node}
+                <div class="ml-2">
+                  {node.friendlyName} — macOS {node.version} ({node.buildVersion})
+                </div>
+              {/each}
+            </div>
+            <p class="text-xs text-white/60">
+              <span class="text-yellow-300">Suggested action:</span> Update all devices
+              to the same macOS version for best compatibility.
+            </p>
+          </div>
+        </div>
+      {/if}
+
+      {#if devicesOnOtherVersions.length > 0}
+        <div class="group relative" role="alert">
+          <div
+            class="flex items-center gap-2 px-3 py-2 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm cursor-help"
+          >
+            <svg
+              class="w-5 h-5 text-yellow-400 flex-shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d={warningIconPath}
+              />
+            </svg>
+            <span class="text-sm font-mono text-yellow-200">
+              DEVICE ON ANOTHER EXO VERSION
+            </span>
+          </div>
+
+          <!-- Tooltip on hover -->
+          <div
+            class="absolute top-full left-0 mt-2 w-80 p-3 rounded border border-yellow-500/30 bg-exo-dark-gray/95 backdrop-blur-sm opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 shadow-lg"
+          >
+            <p class="text-xs text-white/80 mb-2">
+              A device on your network uses this cluster's name but runs another
+              version or build of exo, so it can't join this cluster. Mixing
+              versions in one cluster isn't supported.
+            </p>
+            <div class="text-xs text-white/60 mb-2">
+              {#each devicesOnOtherVersions.slice(0, 4) as device}
+                <div class="ml-2 break-words">{describeDevice(device)}</div>
+              {/each}
+              {#if devicesOnOtherVersions.length > 4}
+                <div class="ml-2">
+                  and {devicesOnOtherVersions.length - 4} more devices
+                </div>
+              {/if}
+            </div>
+            <p class="text-xs text-white/60">
+              <span class="text-yellow-300">Suggested action:</span> Update both devices
+              to the same version of exo.
+            </p>
+          </div>
+        </div>
+      {/if}
+
+      {#if tb5WithoutRdma && !tb5InfoDismissed}
+        <div class="group relative" role="status">
+          <div
+            class="flex items-center gap-2 px-3 py-2 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm cursor-help"
+          >
+            <svg
+              class="w-5 h-5 text-yellow-400 flex-shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d={warningIconPath}
+              />
+            </svg>
+            <span class="text-sm font-mono text-yellow-200">
+              RDMA NOT ENABLED
+            </span>
+            <button
+              type="button"
+              onclick={dismissTb5Info}
+              class="ml-1 text-yellow-300/60 hover:text-yellow-200 transition-colors cursor-pointer"
+              title="Dismiss"
+            >
+              <svg
+                class="w-4 h-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+          <!-- Tooltip on hover -->
+          <div
+            class="absolute top-full left-0 mt-2 w-80 p-3 rounded border border-yellow-500/30 bg-exo-dark-gray/95 backdrop-blur-sm opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 shadow-lg"
+          >
+            <p class="text-xs text-white/80 mb-2">
+              Your devices are connected with Thunderbolt 5, but RDMA isn't
+              enabled on all of them. Enable it for much faster communication
+              between devices.
+            </p>
+            <p class="text-xs text-white/60 mb-1.5">
+              <span class="text-yellow-300">To enable:</span>
+            </p>
+            <ol
+              class="text-xs text-white/60 list-decimal list-inside space-y-0.5 mb-1.5"
+            >
+              <li>Connect devices with Thunderbolt 5 cables</li>
+              <li>Boot to Recovery (hold power 10s → Options)</li>
+              <li>Open Terminal from the Utilities menu</li>
+              <li>
+                Run
+                <code class="text-yellow-300 bg-yellow-400/10 px-1 rounded"
+                  >rdma_ctl enable</code
+                >
+              </li>
+              <li>Reboot</li>
+            </ol>
+            <p class="text-xs text-white/40">
+              Requires macOS 26.2+, TB5 cables, and matching OS versions.
+            </p>
+          </div>
+        </div>
+      {/if}
+
+      {#if macStudioEn2RdmaWarning && !macStudioEn2Dismissed}
+        <div class="group relative" role="alert">
+          <div
+            class="flex items-center gap-2 px-3 py-2 rounded border border-red-500/50 bg-red-500/10 backdrop-blur-sm cursor-help"
+          >
+            <svg
+              class="w-5 h-5 text-red-400 flex-shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                d={warningIconPath}
+              />
+            </svg>
+            <span class="text-sm font-mono text-red-200">
+              RDMA INCOMPATIBLE PORT
+            </span>
+            <button
+              type="button"
+              onclick={dismissMacStudioEn2}
+              class="ml-1 text-red-300/60 hover:text-red-200 transition-colors cursor-pointer"
+              title="Dismiss"
+            >
+              <svg
+                class="w-4 h-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+
+          <!-- Expanded tooltip on hover -->
+          <div
+            class="absolute top-full left-0 mt-2 w-96 p-4 rounded border border-red-500/30 bg-[#1a1a1a]/95 backdrop-blur-sm opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50 shadow-lg"
+          >
+            <p class="text-xs text-white/80 mb-3">
+              The Thunderbolt 5 port next to the Ethernet port on Mac Studio
+              does
+              <span class="text-red-400 font-semibold">not support RDMA</span>.
+              Move the cable to one of the other three TB5 ports.
+            </p>
+
+            <div class="text-xs text-white/60 mb-3">
+              <span class="text-red-300">Affected:</span>
+              {#each macStudioEn2RdmaWarning as conn}
+                <div class="ml-2 mt-0.5">
+                  <span class="text-white/80">{conn.nodeName}</span>
+                  <span class="text-white/30">&rarr;</span>
+                  <span class="text-white/60">{conn.peerNodeName}</span>
+                  <span class="text-white/30 ml-1">(en2)</span>
+                </div>
+              {/each}
+            </div>
+
+            <!-- Mac Studio back panel illustration -->
+            <div class="bg-black/40 rounded p-3 mb-3">
+              <p
+                class="text-[10px] font-mono text-white/30 uppercase tracking-wider mb-2"
+              >
+                Mac Studio — Rear Panel
+              </p>
+              <svg
+                viewBox="0 0 320 72"
+                class="w-full"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <rect
+                  x="1"
+                  y="1"
+                  width="318"
+                  height="70"
+                  rx="6"
+                  ry="6"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.12)"
+                  stroke-width="1"
+                />
+                <!-- TB5 port 1 -->
+                <rect
+                  x="24"
+                  y="22"
+                  width="28"
+                  height="14"
+                  rx="4"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.3)"
+                  stroke-width="1"
+                />
+                <text
+                  x="38"
+                  y="52"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.25)"
+                  style="font-size:7px;font-family:ui-monospace,monospace;"
+                  >TB5</text
+                >
+                <!-- TB5 port 2 -->
+                <rect
+                  x="62"
+                  y="22"
+                  width="28"
+                  height="14"
+                  rx="4"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.3)"
+                  stroke-width="1"
+                />
+                <text
+                  x="76"
+                  y="52"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.25)"
+                  style="font-size:7px;font-family:ui-monospace,monospace;"
+                  >TB5</text
+                >
+                <!-- TB5 port 3 -->
+                <rect
+                  x="100"
+                  y="22"
+                  width="28"
+                  height="14"
+                  rx="4"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.3)"
+                  stroke-width="1"
+                />
+                <text
+                  x="114"
+                  y="52"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.25)"
+                  style="font-size:7px;font-family:ui-monospace,monospace;"
+                  >TB5</text
+                >
+                <!-- TB5 port 4: INCOMPATIBLE (en2) — equally spaced with ports 1-3 -->
+                <rect
+                  x="138"
+                  y="22"
+                  width="28"
+                  height="14"
+                  rx="4"
+                  fill="rgba(239,68,68,0.1)"
+                  stroke="rgba(239,68,68,0.7)"
+                  stroke-width="1.5"
+                />
+                <line
+                  x1="142"
+                  y1="25"
+                  x2="162"
+                  y2="33"
+                  stroke="rgba(239,68,68,0.8)"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+                <line
+                  x1="162"
+                  y1="25"
+                  x2="142"
+                  y2="33"
+                  stroke="rgba(239,68,68,0.8)"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+                <text
+                  x="152"
+                  y="52"
+                  text-anchor="middle"
+                  fill="rgba(239,68,68,0.6)"
+                  style="font-size:7px;font-family:ui-monospace,monospace;font-weight:600;"
+                  >en2</text
+                >
+                <!-- Ethernet port -->
+                <rect
+                  x="196"
+                  y="19"
+                  width="24"
+                  height="20"
+                  rx="2"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.2)"
+                  stroke-width="1"
+                />
+                <rect
+                  x="200"
+                  y="23"
+                  width="16"
+                  height="12"
+                  rx="1"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.12)"
+                  stroke-width="0.75"
+                />
+                <text
+                  x="208"
+                  y="52"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.25)"
+                  style="font-size:7px;font-family:ui-monospace,monospace;"
+                  >ETH</text
+                >
+                <!-- Green checkmarks on working ports -->
+                <circle
+                  cx="38"
+                  cy="62"
+                  r="3"
+                  fill="none"
+                  stroke="rgba(74,222,128,0.5)"
+                  stroke-width="0.75"
+                />
+                <circle
+                  cx="76"
+                  cy="62"
+                  r="3"
+                  fill="none"
+                  stroke="rgba(74,222,128,0.5)"
+                  stroke-width="0.75"
+                />
+                <circle
+                  cx="114"
+                  cy="62"
+                  r="3"
+                  fill="none"
+                  stroke="rgba(74,222,128,0.5)"
+                  stroke-width="0.75"
+                />
+              </svg>
+            </div>
+
+            <p class="text-xs text-white/50">
+              <span class="text-green-400">Fix:</span> Move the Thunderbolt cable
+              to any of the three leftmost ports (all support RDMA).
+            </p>
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet clusterWarningsCompact()}
+  {#if tbBridgeCycles.length > 0 || macosVersionMismatch || devicesOnOtherVersions.length > 0 || (tb5WithoutRdma && !tb5InfoDismissed) || (macStudioEn2RdmaWarning && !macStudioEn2Dismissed)}
+    <div class="absolute top-2 left-2 flex flex-col gap-1">
+      {#if tbBridgeCycles.length > 0}
+        <div
+          class="flex items-center gap-1.5 px-2 py-1 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm"
+          title="Thunderbolt Bridge loop detected"
+        >
+          <svg
+            class="w-3.5 h-3.5 text-yellow-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d={warningIconPath}
+            />
+          </svg>
+          <span class="text-[10px] font-mono text-yellow-200">TB LOOP</span>
+        </div>
+      {/if}
+      {#if macosVersionMismatch}
+        <div
+          class="flex items-center gap-1.5 px-2 py-1 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm"
+          title="Incompatible macOS versions detected"
+        >
+          <svg
+            class="w-3.5 h-3.5 text-yellow-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d={warningIconPath}
+            />
+          </svg>
+          <span class="text-[10px] font-mono text-yellow-200"
+            >macOS MISMATCH</span
+          >
+        </div>
+      {/if}
+      {#if devicesOnOtherVersions.length > 0}
+        <div
+          class="flex items-center gap-1.5 px-2 py-1 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm"
+          title="A device on your network runs another version of exo and can't join this cluster"
+        >
+          <svg
+            class="w-3.5 h-3.5 text-yellow-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d={warningIconPath}
+            />
+          </svg>
+          <span class="text-[10px] font-mono text-yellow-200"
+            >OTHER EXO VERSION</span
+          >
+        </div>
+      {/if}
+      {#if tb5WithoutRdma && !tb5InfoDismissed}
+        <div
+          class="flex items-center gap-1.5 px-2 py-1 rounded border border-yellow-500/50 bg-yellow-500/10 backdrop-blur-sm"
+          title="Devices connected with Thunderbolt 5 — RDMA not enabled. Enable it for faster communication between devices."
+        >
+          <svg
+            class="w-3.5 h-3.5 text-yellow-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d={warningIconPath}
+            />
+          </svg>
+          <span class="text-[10px] font-mono text-yellow-200"
+            >RDMA NOT ENABLED</span
+          >
+        </div>
+      {/if}
+      {#if macStudioEn2RdmaWarning && !macStudioEn2Dismissed}
+        <div
+          class="flex items-center gap-1.5 px-2 py-1 rounded border border-red-500/50 bg-red-500/10 backdrop-blur-sm"
+          title="Mac Studio RDMA incompatible port (en2) — move cable to another TB5 port"
+        >
+          <svg
+            class="w-3.5 h-3.5 text-red-400"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d={warningIconPath}
+            />
+          </svg>
+          <span class="text-[10px] font-mono text-red-200">BAD RDMA PORT</span>
+        </div>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+<!-- Global event listeners for slider dragging + onboarding keyboard nav -->
+<svelte:window
+  onmousemove={handleSliderMouseMove}
+  onmouseup={handleSliderMouseUp}
+  ontouchmove={handleSliderTouchMove}
+  ontouchend={handleSliderTouchEnd}
+  onkeydown={(e) => {
+    if (!showOnboardingOverlay || stepTransitioning || explainerStep === 0)
+      return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeExplainer();
+    } else if (e.key === "ArrowRight" || e.key === " " || e.key === "Enter") {
+      if (showContinueButton) {
+        e.preventDefault();
+        advanceExplainer(explainerStep + 1);
+      }
+    }
+  }}
+/>
+
+<div
+  class="relative h-screen w-full flex flex-col bg-exo-dark-gray overflow-hidden"
+>
+  <!-- Says when a running model becomes unavailable, for screen readers -->
+  <div class="sr-only" role="status" aria-live="polite">
+    {healthAnnouncement}
+  </div>
+  <!-- Scanline overlay -->
+  <!-- Scanline overlay -->
+  <div
+    class="fixed inset-0 pointer-events-none z-50 scanlines"
+    style="transition: opacity 0.5s ease; opacity: {showOnboardingOverlay
+      ? 0
+      : 0.2};"
+  ></div>
+
+  <!-- Shooting Stars Background -->
+  <div
+    class="shooting-stars"
+    style="transition: opacity 0.5s ease; opacity: {showOnboardingOverlay
+      ? 0.4
+      : 1};"
+  >
+    <div
+      class="shooting-star"
+      style="top: 10%; left: 20%; --duration: 45s; --delay: 0s;"
+    ></div>
+    <div
+      class="shooting-star"
+      style="top: 30%; left: 65%; --duration: 45s; --delay: 15s;"
+    ></div>
+    <div
+      class="shooting-star"
+      style="top: 50%; left: 40%; --duration: 45s; --delay: 30s;"
+    ></div>
+  </div>
+
+  {#if showOnboardingOverlay}
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <!-- FULL-SCREEN ONBOARDING WIZARD (overlay)                -->
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <div
+      class="absolute inset-0 flex items-center justify-center z-30 bg-exo-black"
+      style="transition: opacity 0.45s cubic-bezier(0.4, 0, 0.2, 1); opacity: {onboardingFadingOut
+        ? 0
+        : 1};"
+    >
+      {#if explainerStep >= 1}
+        <!-- "How EXO works", steps 1-4: cinematic SVG animation story -->
+        <div
+          class="flex flex-col items-center w-full max-w-3xl px-8"
+          style="transition: opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1), transform 0.6s cubic-bezier(0.4, 0, 0.2, 1); opacity: {stepTransitioning
+            ? 0
+            : 1}; transform: scale({stepTransitioning ? 0.98 : 1});"
+        >
+          <!-- Logo + Step title -->
+          <div class="text-center mb-8">
+            <!-- Logo — smoothly shrinks away when leaving step 1 -->
+            <div
+              style="opacity: {$logoOpacity}; max-height: {$logoOpacity *
+                80}px; overflow: hidden; transition: max-height 0.6s cubic-bezier(0.4, 0, 0.2, 1);"
+            >
+              <img src="/exo-logo.png" alt="EXO" class="w-36 mx-auto mb-10" />
+            </div>
+
+            <!-- Title — single element, text updates instantly -->
+            <h1
+              class="text-2xl font-light text-white/90 tracking-wide"
+              style="opacity: {$titleOpacity}; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; letter-spacing: 0.02em;"
+            >
+              {explainerStep === 1
+                ? "EXO connects your devices into one AI cluster."
+                : stepTitle}
+            </h1>
+
+            <!-- Subtitle — uses tweened opacity, reserves space to prevent layout shift -->
+            <p
+              class="text-sm mt-2 text-white/40 max-w-md mx-auto"
+              style="opacity: {$subtitleOpacity}; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; font-weight: 300; min-height: 1.5em;"
+            >
+              {#if explainerStep === 2}
+                &nbsp;
+              {:else if explainerStep === 3}
+                The model is automatically distributed. Each device handles a
+                piece.
+              {:else if explainerStep === 4}
+                {stepTitle === "Start it again on the remaining devices"
+                  ? "Models using that device stop. You can start them again on the devices that are left."
+                  : "Devices can leave anytime. Laptops close, machines restart."}
+              {:else}
+                &nbsp;
+              {/if}
+            </p>
+          </div>
+
+          <!-- Device display area -->
+          <div class="relative w-full" style="height: 420px;">
+            <!-- Device count label — fades in on step 1, fades out on step 2 -->
+            <p
+              class="absolute left-0 right-0 text-center text-lg text-white/50 font-light tracking-wide z-10"
+              style="top: 20px; opacity: {$deviceCountOpacity}; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; pointer-events: none;"
+            >
+              Your cluster
+            </p>
+
+            <!-- Step 1: Real topology graph -->
+            {#if explainerStep <= 1 || $topologyOpacity > 0.01}
+              <div
+                class="absolute inset-0 flex items-center justify-center"
+                style="opacity: {$topologyOpacity}; pointer-events: none;"
+              >
+                <TopologyGraph class="w-full h-full" />
+              </div>
+            {/if}
+
+            <!-- Steps 2+: Tweened SVG canvas with device pair -->
+            <svg
+              viewBox="0 0 700 420"
+              class="w-full h-full"
+              xmlns="http://www.w3.org/2000/svg"
+              style="position: relative;"
+            >
+              <!-- Device 1 (User's device) -->
+              <g
+                transform="translate({$device1X}, 210)"
+                opacity={$device1Opacity}
+                style="transition: opacity 0.6s ease;"
+              >
+                <DeviceIcon
+                  deviceType={userDeviceInfo.deviceType}
+                  cx={0}
+                  cy={0}
+                  size={110}
+                  ramPercent={60}
+                  uid="onb-d1"
+                />
+                <text
+                  x="0"
+                  y="-105"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.9)"
+                  style="font-size: 15px; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; font-weight: 500; letter-spacing: 0.01em;"
+                >
+                  {userDeviceInfo.name}
+                </text>
+                <text
+                  x="0"
+                  y="105"
+                  text-anchor="middle"
+                  style="font-size: 14px; font-family: 'SF Mono', ui-monospace, monospace;"
+                >
+                  <tspan fill={exoYellow(0.9)}>{userDeviceInfo.memoryGB}</tspan
+                  ><tspan fill="rgba(255,255,255,0.4)">{" "}GB</tspan>
+                </text>
+              </g>
+
+              <!-- Device 2 (another Mac — an example) -->
+              <g
+                transform="translate({$device2X}, 210)"
+                opacity={$device2Opacity}
+                style="transition: opacity 0.6s ease;"
+              >
+                <!-- Dashed outline to indicate simulated device -->
+                <rect
+                  x={(-110 * 1.25) / 2 - 6}
+                  y={(-110 * 0.85) / 2 - 6}
+                  width={110 * 1.25 + 12}
+                  height={110 * 0.85 + 12}
+                  rx="6"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.12)"
+                  stroke-dasharray="4,4"
+                />
+                <DeviceIcon
+                  deviceType="mac studio"
+                  cx={0}
+                  cy={0}
+                  size={110}
+                  ramPercent={80}
+                  uid="onb-d2"
+                />
+                <text
+                  x="0"
+                  y="-105"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.9)"
+                  style="font-size: 15px; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; font-weight: 500; letter-spacing: 0.01em;"
+                >
+                  Another Mac
+                </text>
+                <text
+                  x="0"
+                  y="105"
+                  text-anchor="middle"
+                  style="font-size: 14px; font-family: 'SF Mono', ui-monospace, monospace;"
+                >
+                  <tspan fill={exoYellow(0.9)}>{SIMULATED_STUDIO_GB}</tspan
+                  ><tspan fill="rgba(255,255,255,0.4)">{" "}GB</tspan>
+                </text>
+                <text
+                  x="0"
+                  y="120"
+                  text-anchor="middle"
+                  fill="rgba(255,255,255,0.2)"
+                  style="font-size: 9px; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; font-style: italic;"
+                >
+                  (example)
+                </text>
+              </g>
+
+              <!-- Connection line between devices -->
+              <line
+                x1={$device1X + 85}
+                y1={210}
+                x2={$device2X - 85}
+                y2={210}
+                stroke={$connectionIsRed > 0.5
+                  ? "rgba(220,38,38,0.7)"
+                  : "rgba(255,255,255,0.15)"}
+                stroke-width="1.5"
+                stroke-dasharray="6,6"
+                opacity={$connectionOpacity}
+                class={$connectionIsRed > 0.5
+                  ? "onboarding-connection-line-red"
+                  : "onboarding-connection-line"}
+              />
+
+              <!-- Disconnect X mark -->
+              {#if $disconnectXOpacity > 0.01}
+                <g
+                  transform="translate({($device1X + $device2X) / 2}, 210)"
+                  opacity={$disconnectXOpacity}
+                >
+                  <circle
+                    r="18"
+                    fill="rgba(220,38,38,0.1)"
+                    stroke="rgba(220,38,38,0.6)"
+                    stroke-width="1.5"
+                  />
+                  <line
+                    x1="-8"
+                    y1="-8"
+                    x2="8"
+                    y2="8"
+                    stroke="rgba(220,38,38,0.8)"
+                    stroke-width="2.5"
+                    stroke-linecap="round"
+                  />
+                  <line
+                    x1="8"
+                    y1="-8"
+                    x2="-8"
+                    y2="8"
+                    stroke="rgba(220,38,38,0.8)"
+                    stroke-width="2.5"
+                    stroke-linecap="round"
+                  />
+                </g>
+              {/if}
+
+              <!-- Combined memory label -->
+              <text
+                x={($device1X + $device2X) / 2}
+                y={130}
+                text-anchor="middle"
+                fill={exoYellow(0.7)}
+                style="font-size: 14px; font-family: 'SF Mono', ui-monospace, monospace; font-weight: 500; letter-spacing: 0.02em;"
+                opacity={$combinedLabelOpacity}
+              >
+                {onboardingCombinedGB} GB combined
+              </text>
+
+              <!-- Step 2: Models unlocked — staggered slide-up + yellow glow -->
+              {#if unlockedModels.length > 0 && $chipPhase > 0.01}
+                {@const centerX = ($device1X + $device2X) / 2}
+                {@const chipW = 140}
+                {@const chipH = 30}
+                {@const chipGap = 12}
+                {@const totalW =
+                  unlockedModels.length * chipW +
+                  (unlockedModels.length - 1) * chipGap}
+                {@const startX = centerX - totalW / 2}
+                <!-- SVG filter for yellow glow -->
+                <defs>
+                  <filter
+                    id="chip-glow"
+                    x="-50%"
+                    y="-50%"
+                    width="200%"
+                    height="200%"
+                  >
+                    <feGaussianBlur
+                      in="SourceGraphic"
+                      stdDeviation="4"
+                      result="blur"
+                    />
+                    <feColorMatrix
+                      in="blur"
+                      type="matrix"
+                      values="1 0.8 0 0 0  0.8 0.7 0 0 0  0 0 0 0 0  0 0 0 0.4 0"
+                      result="glow"
+                    />
+                    <feMerge>
+                      <feMergeNode in="glow" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                </defs>
+                <!-- Header slides up + fades with yellow tint -->
+                {@const headerProgress = Math.min(1, $chipPhase)}
+                {@const headerY = 332 + 12 * (1 - headerProgress)}
+                {@const yellowR = 234}
+                {@const yellowG = 179}
+                {@const yellowB = 8}
+                <text
+                  x={centerX}
+                  y={headerY}
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                  fill="rgba({yellowR},{yellowG},{yellowB},{0.5 *
+                    headerProgress})"
+                  opacity={headerProgress}
+                  style="font-size: 10px; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; font-weight: 500; letter-spacing: 0.1em;"
+                >
+                  NEW MODELS UNLOCKED
+                </text>
+                <!-- Model chips — staggered slide-up + scale + yellow highlight -->
+                {#each unlockedModels as model, i}
+                  {@const stagger = i * 0.6}
+                  {@const progress = Math.max(
+                    0,
+                    Math.min(1, $chipPhase - stagger),
+                  )}
+                  {@const modelName = getModelDisplayName(model.id).slice(
+                    0,
+                    18,
+                  )}
+                  {@const modelSize = Math.round(getModelSizeGB(model))}
+                  {@const slideY = 16 * (1 - progress)}
+                  {@const chipScale = 0.85 + 0.15 * progress}
+                  <!-- Yellow highlight peaks at ~0.6 progress then settles to subtle -->
+                  {@const highlightPeak =
+                    progress < 0.6
+                      ? progress / 0.6
+                      : 1 - ((progress - 0.6) / 0.4) * 0.6}
+                  {@const borderYellow = 0.15 + 0.35 * highlightPeak}
+                  {@const fillYellow = 0.02 + 0.06 * highlightPeak}
+                  {#if progress > 0}
+                    <g
+                      transform="translate({startX +
+                        i * (chipW + chipGap) +
+                        chipW / 2}, {358 + slideY}) scale({chipScale})"
+                      opacity={progress}
+                      filter={highlightPeak > 0.3 ? "url(#chip-glow)" : "none"}
+                    >
+                      <rect
+                        x={-chipW / 2}
+                        y={-chipH / 2}
+                        width={chipW}
+                        height={chipH}
+                        rx="15"
+                        fill="rgba({yellowR},{yellowG},{yellowB},{fillYellow})"
+                        stroke="rgba({yellowR},{yellowG},{yellowB},{borderYellow})"
+                        stroke-width="1"
+                      />
+                      <text
+                        x="0"
+                        y={modelSize ? -4 : 1}
+                        text-anchor="middle"
+                        dominant-baseline="middle"
+                        fill="rgba(255,255,255,{0.5 + 0.3 * progress})"
+                        style="font-size: 10px; font-family: 'SF Mono', ui-monospace, monospace; font-weight: 500;"
+                      >
+                        {modelName}
+                      </text>
+                      {#if modelSize}
+                        <text
+                          x="0"
+                          y="8"
+                          text-anchor="middle"
+                          dominant-baseline="middle"
+                          fill="rgba(255,255,255,{0.15 + 0.15 * progress})"
+                          style="font-size: 8px; font-family: 'SF Mono', ui-monospace, monospace; font-weight: 400;"
+                        >
+                          {modelSize} GB
+                        </text>
+                      {/if}
+                    </g>
+                  {/if}
+                {/each}
+              {/if}
+
+              <!-- Model block (unified or split) -->
+              {#if $modelBlockOpacity > 0.01}
+                {#if $modelSplitProgress < 0.05}
+                  <!-- Unified model block — centers on device1 when device2 is hidden -->
+                  {@const modelCenterX =
+                    $device2Opacity > 0.3
+                      ? ($device1X + $device2X) / 2
+                      : $device1X}
+                  <g
+                    transform="translate({modelCenterX}, {$modelBlockY})"
+                    opacity={$modelBlockOpacity}
+                  >
+                    <rect
+                      x="-45"
+                      y="-13"
+                      width="90"
+                      height="26"
+                      rx="6"
+                      fill="rgba(180,140,0,0.08)"
+                      stroke="rgba(180,140,0,0.45)"
+                      stroke-width="1.5"
+                    />
+                    <text
+                      x="0"
+                      y="5"
+                      text-anchor="middle"
+                      fill="rgba(220,180,40,0.9)"
+                      style="font-size: 12px; font-family: -apple-system, system-ui, sans-serif; font-weight: 500;"
+                    >
+                      Model
+                    </text>
+                  </g>
+                {:else}
+                  <!-- Split model halves flowing down to each device -->
+                  {@const splitX =
+                    $modelSplitProgress * (($device2X - $device1X) / 2)}
+                  {@const centerX = ($device1X + $device2X) / 2}
+                  {@const splitY = $modelBlockY + $modelSplitProgress * 80}
+
+                  <!-- Left half -> Device 1 -->
+                  <g
+                    transform="translate({centerX - splitX}, {splitY})"
+                    opacity={$modelBlockOpacity}
+                  >
+                    <rect
+                      x="-45"
+                      y="-13"
+                      width="90"
+                      height="26"
+                      rx="6"
+                      fill="rgba(180,140,0,0.08)"
+                      stroke="rgba(180,140,0,0.35)"
+                      stroke-width="1"
+                    />
+                    <text
+                      x="0"
+                      y="4"
+                      text-anchor="middle"
+                      fill="rgba(220,180,40,0.75)"
+                      style="font-size: 11px; font-family: -apple-system, system-ui, sans-serif;"
+                    >
+                      Part 1/2
+                    </text>
+                  </g>
+
+                  <!-- Right half -> Device 2 -->
+                  <g
+                    transform="translate({centerX + splitX}, {splitY})"
+                    opacity={$modelBlockOpacity * $device2Opacity}
+                  >
+                    <rect
+                      x="-45"
+                      y="-13"
+                      width="90"
+                      height="26"
+                      rx="6"
+                      fill="rgba(180,140,0,0.08)"
+                      stroke="rgba(180,140,0,0.35)"
+                      stroke-width="1"
+                    />
+                    <text
+                      x="0"
+                      y="4"
+                      text-anchor="middle"
+                      fill="rgba(220,180,40,0.75)"
+                      style="font-size: 11px; font-family: -apple-system, system-ui, sans-serif;"
+                    >
+                      Part 2/2
+                    </text>
+                  </g>
+                {/if}
+              {/if}
+            </svg>
+          </div>
+
+          <!-- Continue button — shown once each step's animation is done -->
+          <div
+            style="transition: opacity 0.4s ease, transform 0.4s cubic-bezier(0.4,0,0.2,1); opacity: {showContinueButton
+              ? 1
+              : 0}; transform: translateY({showContinueButton
+              ? '0px'
+              : '12px'}); pointer-events: {showContinueButton
+              ? 'auto'
+              : 'none'}; margin-top: 0.5rem;"
+          >
+            <button
+              type="button"
+              onclick={() => advanceExplainer(explainerStep + 1)}
+              class="inline-flex items-center gap-2.5 px-10 py-3.5 bg-exo-yellow text-exo-black text-sm font-semibold rounded-full cursor-pointer"
+              style="transition: transform 0.2s ease, box-shadow 0.3s ease, filter 0.2s ease; font-family: -apple-system, 'SF Pro Display', system-ui, sans-serif; letter-spacing: 0.02em;"
+              onmouseenter={(e) => {
+                e.currentTarget.style.filter = "brightness(1.08)";
+                e.currentTarget.style.boxShadow = `0 0 30px ${exoYellow(0.2)}`;
+              }}
+              onmouseleave={(e) => {
+                e.currentTarget.style.filter = "brightness(1)";
+                e.currentTarget.style.boxShadow = "none";
+              }}
+            >
+              Continue
+              <svg
+                class="w-4 h-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2.5"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M13 7l5 5m0 0l-5 5m5-5H6"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+      {:else if onboardingStep === 6}
+        <!-- Pick a model: the recommended small one first, bigger ones after -->
+        <div
+          class="flex flex-col items-center w-full max-w-xl px-8"
+          style="opacity: 0; animation: onb-fade-in 0.5s ease forwards;"
+        >
+          <div class="text-center mb-8">
+            <h1
+              class="text-xl font-sans font-light text-white/90 mb-2 tracking-wide"
+            >
+              Pick a model to start
+            </h1>
+            <p class="text-sm font-sans text-white/40">
+              {nodeCount > 1
+                ? `Your ${nodeCount} devices have`
+                : `Your ${localDeviceIsMac ? "Mac" : "device"} has`}
+              {Math.round(availableMemoryGB())} GB of memory free.
+            </p>
+          </div>
+
+          {#if onboardingError}
+            <div
+              class="w-full mb-6 px-4 py-3 rounded-lg border border-red-500/30 bg-red-500/10 text-sm font-mono text-red-400"
+              in:fade={{ duration: 200 }}
+            >
+              {onboardingError}
+            </div>
+          {:else if onboardingNote}
+            <div
+              class="w-full mb-6 px-4 py-3 rounded-lg border border-white/10 bg-white/5 text-sm font-sans text-white/60"
+              role="status"
+              in:fade={{ duration: 200 }}
+            >
+              {onboardingNote}
+            </div>
+          {/if}
+
+          {#if !onboardingRecommendedModel && onboardingOtherModels.length === 0}
+            <div class="text-center py-8">
+              <div class="text-sm text-white/40 font-sans animate-pulse">
+                Loading models…
+              </div>
+            </div>
+          {:else}
+            {#if onboardingRecommendedModel}
+              {@const model = onboardingRecommendedModel}
+              <button
+                type="button"
+                onclick={() => onboardingLaunchModel(model.id)}
+                title={model.id}
+                class="group w-full flex items-center justify-between gap-4 px-5 py-4 rounded-xl border border-exo-yellow/40 bg-exo-yellow/5 hover:border-exo-yellow/70 hover:bg-exo-yellow/10 transition-all duration-200 cursor-pointer text-left"
+              >
+                <div class="flex flex-col items-start gap-1 min-w-0">
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span
+                      class="text-base font-sans font-medium text-white truncate"
+                      >{getModelDisplayName(model.id)}</span
+                    >
+                    <span
+                      class="flex-shrink-0 text-[10px] font-sans font-semibold px-2 py-0.5 rounded-full bg-exo-yellow text-exo-black"
+                      >Recommended</span
+                    >
+                  </div>
+                  <span class="text-xs font-sans text-white/50"
+                    >Quick to download, good for everyday chat</span
+                  >
+                  <span
+                    class="text-xs font-mono text-white/40"
+                    title="Download times are estimated for a 100 Mbit/s connection"
+                    >{describeOnboardingDownload(model)}</span
+                  >
+                </div>
+                <span
+                  class="flex-shrink-0 px-5 py-2 rounded-full bg-exo-yellow text-exo-black text-sm font-sans font-semibold group-hover:brightness-110"
+                  >Start</span
+                >
+              </button>
+            {/if}
+            {#if onboardingOtherModels.length > 0}
+              <p class="w-full text-xs font-sans text-white/40 mt-8 mb-3">
+                Bigger models
+              </p>
+              <div class="w-full space-y-2">
+                {#each onboardingOtherModels as model}
+                  <button
+                    type="button"
+                    onclick={() => onboardingLaunchModel(model.id)}
+                    title={model.id}
+                    class="w-full flex items-center justify-between gap-4 px-4 py-3 rounded-lg border border-white/10 bg-white/[0.03] hover:border-exo-yellow/50 hover:bg-exo-yellow/5 transition-all duration-200 cursor-pointer text-left"
+                  >
+                    <span
+                      class="min-w-0 truncate text-sm font-sans text-white/80"
+                    >
+                      {getModelDisplayName(model.id)}
+                      {#if model.quantization}
+                        <span class="text-white/40">· {model.quantization}</span
+                        >
+                      {/if}
+                    </span>
+                    <span
+                      class="flex-shrink-0 text-xs font-mono text-white/40"
+                      title="Download times are estimated for a 100 Mbit/s connection"
+                      >{describeOnboardingDownload(model)}</span
+                    >
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+
+          <button
+            type="button"
+            onclick={() => {
+              modelPickerContext = "dashboard";
+              isModelPickerOpen = true;
+            }}
+            class="mt-6 text-sm font-sans text-white/40 hover:text-exo-yellow transition-colors cursor-pointer underline underline-offset-4 decoration-white/20 hover:decoration-exo-yellow/50"
+          >
+            More models…
+          </button>
+          <p class="mt-8 text-xs font-sans text-white/30 text-center">
+            Want bigger models? Add another {localDeviceIsMac
+              ? "Mac"
+              : "device"}, and EXO combines their memory.
+          </p>
+        </div>
+      {:else if onboardingStep === 7}
+        <!-- Getting the model ready: its download and loading, as one step -->
+        <div
+          class="text-center w-full max-w-lg px-8"
+          style="opacity: 0; animation: onb-fade-in 0.5s ease forwards;"
+        >
+          <h1
+            class="text-xl font-sans font-light text-white/90 mb-8 tracking-wide"
+          >
+            Getting {onboardingModelId
+              ? getModelDisplayName(onboardingModelId)
+              : "your model"} ready
+          </h1>
+
+          <div class="w-full max-w-md mx-auto space-y-3">
+            <div class="relative h-2 bg-white/10 rounded-full overflow-hidden">
+              {#if onboardingReadiness.percentage !== null}
+                <div
+                  class="absolute inset-y-0 left-0 bg-gradient-to-r from-exo-yellow to-exo-yellow-darker rounded-full transition-all duration-500"
+                  style="width: {onboardingReadiness.percentage}%"
+                ></div>
+              {:else}
+                <div
+                  class="absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-exo-yellow to-exo-yellow-darker rounded-full animate-pulse"
+                ></div>
+              {/if}
+            </div>
+            <p class="text-xs font-mono text-white/50 text-left" role="status">
+              {onboardingReadiness.status}
+            </p>
+          </div>
+
+          {#if onboardingRetryNote}
+            <p class="text-xs font-mono text-yellow-400/80 mt-6">
+              {onboardingRetryNote}
+            </p>
+          {/if}
+
+          <p class="text-xs font-sans text-white/40 mt-8">
+            You can chat as soon as it has downloaded and loaded into memory.
+          </p>
+
+          <button
+            type="button"
+            onclick={pickDifferentOnboardingModel}
+            class="mt-8 px-5 py-2 rounded-full border border-white/20 text-sm font-sans text-white/70 hover:text-white hover:border-white/40 transition-colors cursor-pointer"
+          >
+            Pick a different model
+          </button>
+        </div>
+      {:else if onboardingStep === 9}
+        <!-- Step 9: Ready — centered input with suggestion chips -->
+        <!-- Uses onb-fade-opacity (no transform) so fixed-position dropdown in ChatForm works correctly -->
+        <div
+          class="flex flex-col items-center justify-center w-full max-w-2xl px-8"
+          style="opacity: 0; animation: onb-fade-opacity 0.6s ease forwards;"
+        >
+          <img
+            src="/exo-logo.png"
+            alt="EXO"
+            class="w-28 mb-6"
+            style="opacity: 0.8;"
+          />
+
+          {#if onboardingModelId}
+            <p class="text-sm text-white/40 font-mono mb-6">
+              {getModelDisplayName(onboardingModelId)}
+            </p>
+          {/if}
+
+          <div class="w-full">
+            <!-- No onOpenModelPicker: no model picker is mounted at this step,
+                 so the form shows the onboarding model read-only -->
+            <ChatForm
+              placeholder="Ask anything"
+              autofocus={true}
+              showHelperText={false}
+              showModelSelector={true}
+              modelTasks={modelTasks()}
+              modelCapabilities={modelCapabilities()}
+              onAutoSend={handleChatSend}
+            />
+          </div>
+
+          <div class="flex flex-wrap justify-center gap-3 mt-6">
+            {#each suggestedPrompts as chip}
+              <button
+                type="button"
+                onclick={() => {
+                  completeOnboarding();
+                  handleChatSend(chip);
+                }}
+                class="px-4 py-2 rounded-full border border-white/10 bg-white/5 text-sm text-white/60 hover:bg-white/10 hover:text-white/80 hover:border-white/20 transition-all duration-200 cursor-pointer"
+              >
+                {chip}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <!-- Secondary actions: "How EXO works" and Skip, or Back from the story -->
+      {#if explainerStep >= 1 || onboardingStep > 0}
+        <div class="absolute bottom-8 flex items-center gap-6">
+          {#if explainerStep >= 1}
+            <button
+              type="button"
+              onclick={closeExplainer}
+              class="flex items-center gap-1.5 text-xs font-sans text-white/50 hover:text-white/80 transition-colors duration-300 cursor-pointer"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M10 3L5 8l5 5" />
+              </svg>
+              Back
+            </button>
+          {:else}
+            {#if onboardingStep === 6 || onboardingStep === 7}
+              <button
+                type="button"
+                onclick={openExplainer}
+                class="flex items-center gap-1.5 text-xs font-sans text-white/50 hover:text-white/80 transition-colors duration-300 cursor-pointer"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d={infoIconPath} />
+                </svg>
+                How EXO works
+              </button>
+            {/if}
+            <button
+              type="button"
+              onclick={completeOnboarding}
+              class="flex items-center gap-1.5 text-xs font-sans text-white/50 hover:text-white/80 transition-colors duration-300 cursor-pointer"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 16 16"
+                fill="currentColor"
+              >
+                <path d="M3 2.5v11L9 8 3 2.5z" />
+                <rect x="10.5" y="2.5" width="2.5" height="11" rx="0.5" />
+              </svg>
+              {onboardingStep === 6 ? "Skip for now" : "Skip"}
+            </button>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <!-- Model Picker Modal ("More models…" on the model list) -->
+    {#if onboardingStep === 6}
+      <ModelPickerModal
+        isOpen={isModelPickerOpen}
+        {models}
+        {selectedModelId}
+        favorites={favoritesSet}
+        {recentModelIds}
+        hasRecents={showRecentsTab}
+        existingModelIds={new Set(models.map((m) => m.id))}
+        canModelFit={(modelId) => {
+          const model = models.find((m) => m.id === modelId);
+          return model ? hasEnoughMemory(model) : false;
+        }}
+        getModelFitStatus={(modelId): ModelMemoryFitStatus => {
+          const model = models.find((m) => m.id === modelId);
+          return model ? getModelMemoryFitStatus(model) : "too_large";
+        }}
+        {getModelFitNote}
+        onSelect={(modelId) => {
+          isModelPickerOpen = false;
+          onboardingLaunchModel(modelId);
+        }}
+        onClose={() => (isModelPickerOpen = false)}
+        onToggleFavorite={toggleFavorite}
+        onAddModel={addModelFromPicker}
+        onDeleteModel={deleteCustomModel}
+        totalMemoryGB={clusterMemory().total / (1024 * 1024 * 1024)}
+        usedMemoryGB={clusterMemory().used / (1024 * 1024 * 1024)}
+        {downloadsData}
+        topologyNodes={data?.nodes}
+      />
+    {/if}
+  {/if}
+
+  {#if downloadChoicePrompt}
+    <!-- Asked before auto-pick starts a download. Modal: Escape cancels. -->
+    <dialog
+      use:showDownloadChoiceDialog
+      oncancel={(event) => {
+        event.preventDefault();
+        answerDownloadChoice("cancel");
+      }}
+      aria-labelledby="download-choice-title"
+      class="m-auto w-[calc(100%-2rem)] max-w-md bg-exo-dark-gray text-white border border-exo-yellow/20 rounded-lg shadow-2xl p-5 font-mono backdrop:bg-black/60"
+    >
+      <h3 id="download-choice-title" class="text-sm text-white mb-2">
+        Download {downloadChoicePrompt.modelName} ({downloadChoicePrompt.sizeLabel})?
+      </h3>
+      <p class="text-xs text-exo-light-gray/80 mb-5 leading-relaxed">
+        {#if downloadChoicePrompt.autoPicked}
+          It's the best model that fits, but it isn't {downloadChoicePrompt.partlyDownloaded
+            ? "fully "
+            : ""}downloaded yet. Your message will be sent when it's ready.
+        {:else}
+          It isn't {downloadChoicePrompt.partlyDownloaded
+            ? "fully "
+            : ""}downloaded yet, so you can chat once the download finishes and
+          it has loaded.
+        {/if}
+      </p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button
+          type="button"
+          onclick={() => answerDownloadChoice("cancel")}
+          data-default-choice={downloadChoicePrompt.alternativeName
+            ? undefined
+            : true}
+          class="px-3 py-1.5 text-xs text-exo-light-gray hover:text-white border border-exo-medium-gray/50 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-exo-yellow"
+        >
+          Cancel
+        </button>
+        {#if downloadChoicePrompt.alternativeName}
+          <button
+            type="button"
+            onclick={() => answerDownloadChoice("alternative")}
+            data-default-choice
+            class="px-3 py-1.5 text-xs text-exo-yellow border border-exo-yellow/40 hover:bg-exo-yellow/10 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-exo-yellow"
+          >
+            Use {downloadChoicePrompt.alternativeName}
+            ({downloadChoicePrompt.alternativeRunning ? "ready" : "downloaded"})
+          </button>
+        {/if}
+        <button
+          type="button"
+          onclick={() => answerDownloadChoice("download")}
+          class="px-3 py-1.5 text-xs bg-exo-yellow text-exo-black hover:bg-exo-yellow/90 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-white"
+        >
+          Download
+        </button>
+      </div>
+    </dialog>
+  {/if}
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!-- MAIN DASHBOARD (always rendered, behind onboarding)    -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  {#if !topologyOnlyEnabled}
+    <HeaderNav
+      showHome={true}
+      onHome={handleGoHome}
+      showSidebarToggle={true}
+      {sidebarVisible}
+      onToggleSidebar={toggleChatSidebarVisible}
+      showMobileMenuToggle={true}
+      mobileMenuOpen={mobileChatOpen}
+      onToggleMobileMenu={toggleMobileChatSidebar}
+      showMobileRightToggle={!chatStarted && !topologyOnlyEnabled}
+      {mobileRightOpen}
+      onToggleMobileRight={toggleMobileRightSidebar}
+      downloadProgress={activeDownloadSummary}
+    />
+  {/if}
+
+  <!-- Mobile Chat Sidebar Drawer -->
+  {#if !topologyOnlyEnabled}
+    <ChatSidebar
+      isMobileDrawer={true}
+      isOpen={mobileChatOpen}
+      onClose={() => setMobileChatSidebarOpen(false)}
+      onNewChat={handleNewChat}
+      onSelectConversation={() => {
+        userForcedIdle = false;
+      }}
+    />
+  {/if}
+
+  <!-- Main Content -->
+  <main class="flex-1 flex overflow-hidden relative">
+    <!-- Left: Conversation History Sidebar (hidden in topology-only mode, welcome state, or when toggled off) - Desktop only -->
+    {#if !topologyOnlyEnabled && sidebarVisible}
+      <div
+        class="hidden lg:block w-80 flex-shrink-0 border-r border-exo-yellow/10"
+        role="complementary"
+        aria-label="Conversation history"
+      >
+        <ChatSidebar
+          class="h-full"
+          onNewChat={handleNewChat}
+          onSelectConversation={() => {
+            userForcedIdle = false;
+          }}
+        />
+      </div>
+    {/if}
+
+    {#if topologyOnlyEnabled}
+      <!-- TOPOLOGY ONLY MODE: Full-screen topology -->
+      <div
+        class="flex-1 flex flex-col min-h-0 min-w-0 p-4"
+        in:fade={{ duration: 300 }}
+      >
+        <div
+          class="flex-1 relative bg-exo-dark-gray/40 rounded-lg overflow-hidden"
+        >
+          <TopologyGraph
+            class="w-full h-full"
+            highlightedNodes={highlightedNodes()}
+            filteredNodes={nodeFilter}
+            onNodeClick={togglePreviewNodeFilter}
+          />
+
+          {@render clusterWarnings()}
+
+          <!-- Exit topology-only mode button -->
+          <button
+            type="button"
+            onclick={toggleTopologyOnlyMode}
+            class="absolute bottom-4 right-4 p-2 rounded border border-exo-yellow/30 bg-exo-dark-gray/80 hover:border-exo-yellow/50 hover:bg-exo-dark-gray transition-colors cursor-pointer backdrop-blur-sm"
+            title="Exit topology only mode"
+            aria-label="Exit topology only mode"
+          >
+            <svg
+              class="w-5 h-5 text-exo-yellow"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <circle cx="12" cy="5" r="2" fill="currentColor" />
+              <circle cx="5" cy="19" r="2" fill="currentColor" />
+              <circle cx="19" cy="19" r="2" fill="currentColor" />
+              <path stroke-linecap="round" d="M12 7v5m0 0l-5 5m5-5l5 5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    {:else if !chatStarted}
+      <!-- WELCOME STATE: Topology + Instance Controls (no left sidebar for cleaner look) -->
+      <div
+        class="flex-1 flex overflow-hidden relative"
+        in:fade={{ duration: 300 }}
+        out:fade={{ duration: 200 }}
+      >
+        <!-- Center: MAIN TOPOLOGY DISPLAY -->
+        <div class="flex-1 flex flex-col min-h-0 min-w-0 py-4">
+          <!-- Topology Container - Takes most of the space -->
+          <div
+            class="flex-1 relative bg-exo-dark-gray/40 mx-4 mb-4 rounded-lg overflow-hidden"
+          >
+            <!-- The main topology graph - full container -->
+            <TopologyGraph
+              class="w-full h-full"
+              highlightedNodes={highlightedNodes()}
+              filteredNodes={nodeFilter}
+              onNodeClick={togglePreviewNodeFilter}
+            />
+
+            <!-- Initial loading state before first data fetch -->
+            {#if !update}
+              <div
+                class="absolute inset-0 flex items-center justify-center bg-exo-dark-gray/80"
+                in:fade={{ duration: 200 }}
+                out:fade={{ duration: 300 }}
+              >
+                <div class="text-center">
+                  <div
+                    class="w-8 h-8 border-2 border-exo-yellow/30 border-t-exo-yellow rounded-full animate-spin mx-auto mb-4"
+                  ></div>
+                  <p
+                    class="text-xs font-mono text-white/40 tracking-wider uppercase"
+                  >
+                    Connecting to cluster&hellip;
+                  </p>
+                </div>
+              </div>
+            {/if}
+
+            {@render clusterWarnings()}
+
+            <!-- Node Filter Indicator (top-right corner) -->
+            {#if isFilterActive()}
+              <button
+                onclick={clearPreviewNodeFilter}
+                class="absolute top-2 right-2 flex items-center gap-1.5 px-2 py-1 bg-exo-dark-gray/80 border border-exo-yellow/40 rounded text-exo-yellow hover:border-exo-yellow/60 transition-colors cursor-pointer backdrop-blur-sm"
+                title="Clear filter"
+              >
+                <span class="text-[10px] font-mono tracking-wider">
+                  FILTER: {nodeFilter.size}
+                </span>
+                <svg
+                  class="w-3 h-3"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M6 18L18 6M6 6l12 12"
+                  />
+                </svg>
+              </button>
+            {/if}
+
+            <!-- Only one device: how to add another (bottom-left corner) -->
+            {#if showAddDeviceHint}
+              <div
+                class="absolute bottom-4 left-4 right-4 sm:right-auto sm:max-w-sm flex items-start gap-2 px-3 py-2.5 rounded border border-white/10 bg-exo-dark-gray/90 backdrop-blur-sm"
+                role="status"
+                transition:fade={{ duration: 200 }}
+              >
+                <svg
+                  class="w-4 h-4 mt-px text-white/40 flex-shrink-0"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  aria-hidden="true"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d={infoIconPath}
+                  />
+                </svg>
+                <p class="flex-1 text-xs leading-relaxed text-white/60">
+                  <span class="text-white/80">Only this device so far.</span>
+                  To add another, install EXO on it and start it on the same network
+                  (or connect them with a Thunderbolt cable). Devices connect only
+                  when they run the same version of EXO.
+                </p>
+                <button
+                  type="button"
+                  onclick={dismissAddDeviceHint}
+                  class="text-white/40 hover:text-white/70 transition-colors cursor-pointer flex-shrink-0"
+                  title="Dismiss"
+                  aria-label="Dismiss"
+                >
+                  <svg
+                    class="w-4 h-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M6 18L18 6M6 6l12 12"
+                    />
+                  </svg>
+                </button>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Chat Input - Below topology, never overlaps -->
+          <div class="px-4 pt-4 pb-6 flex-shrink-0">
+            <div class="max-w-3xl mx-auto">
+              {#if homeChatHint}
+                <div class="text-center mb-4">
+                  <p class="text-sm text-white/50 font-sans">
+                    {homeChatHint}
+                  </p>
+                </div>
+              {/if}
+              <ChatForm
+                bind:message={chatDraft}
+                bind:uploadedFiles={chatDraftFiles}
+                placeholder={instanceCount === 0
+                  ? homeChatPlaceholder
+                  : "Ask anything"}
+                showHelperText={false}
+                showModelSelector={true}
+                modelTasks={modelTasks()}
+                modelCapabilities={modelCapabilities()}
+                onOpenModelPicker={openChatModelPicker}
+                onAutoSend={handleChatSend}
+                modelDisplayOverride={bestRunningModelId ?? undefined}
+              />
+            </div>
+          </div>
+        </div>
+
+        <!-- Mobile Right Sidebar Drawer (running models) -->
+        {#if mobileRightOpen}
+          <!-- Overlay backdrop -->
+          <button
+            type="button"
+            class="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden"
+            onclick={() => setMobileRightSidebarOpen(false)}
+            aria-label="Close running models panel"
+          ></button>
+          <!-- Drawer panel -->
+          <aside
+            class="fixed right-0 top-0 bottom-0 w-80 bg-exo-dark-gray border-l border-exo-yellow/10 z-50 flex flex-col md:hidden overflow-y-auto"
+            aria-label="Running models and start a model"
+          >
+            {@render rightSidebarContent()}
+          </aside>
+        {/if}
+
+        <!-- Right Sidebar: Instance Controls (wider on welcome page for better visibility) - Desktop only -->
+        <aside
+          class="hidden md:flex w-80 border-l border-exo-yellow/10 bg-exo-dark-gray flex-col flex-shrink-0"
+          aria-label="Running models and start a model"
+        >
+          {@render rightSidebarContent()}
+        </aside>
+
+        {#snippet rightSidebarContent()}
+          <!-- Running Instances Panel (only shown when instances exist) - Scrollable -->
+          {#if instanceCount > 0 || pendingDeployments.length > 0}
+            <div class="p-4 flex-shrink-0">
+              <!-- Panel Header -->
+              <div class="flex items-center gap-2 mb-4">
+                <div
+                  class="w-2 h-2 bg-exo-yellow rounded-full shadow-[0_0_8px_color-mix(in_srgb,var(--exo-yellow)_60%,transparent)] animate-pulse"
+                ></div>
+                <h3
+                  class="text-xs text-exo-yellow font-mono tracking-[0.2em] uppercase"
+                >
+                  Running models
+                </h3>
+                <div
+                  class="flex-1 h-px bg-gradient-to-r from-exo-yellow/30 to-transparent"
+                ></div>
+              </div>
+
+              <div
+                bind:this={instancesContainerRef}
+                class="max-h-72 xl:max-h-96 space-y-3 overflow-y-auto overflow-x-hidden py-px"
+              >
+                {@render deploymentCards()}
+                {#each Object.entries(instanceData) as [id, instance]}
+                  {@const downloadInfo = getInstanceDownloadStatus(
+                    id,
+                    instance,
+                  )}
+                  {@const healthNote = getInstanceHealthNote(
+                    instance,
+                    downloadInfo.statusText,
+                  )}
+                  {@const statusText =
+                    healthNote?.statusText ?? downloadInfo.statusText}
+                  {@const statusLabel = getInstanceStatusLabel(statusText)}
+                  {@const statusColors = STATUS_COLORS[statusLabel]}
+                  {@const isLoading = statusText === "LOADING"}
+                  {@const isWarmingUp = statusText === "WARMING UP"}
+                  <!-- Instance Card -->
+                  {@const instanceModelId = getInstanceModelId(instance)}
+                  {@const instanceModelName =
+                    getModelDisplayName(instanceModelId)}
+                  {@const instanceInfo = getInstanceInfo(instance)}
+                  {@const instanceConnections =
+                    getInstanceConnections(instance)}
+                  <div
+                    class="relative group cursor-pointer"
+                    role="button"
+                    tabindex="0"
+                    transition:slide={{ duration: 250, easing: cubicOut }}
+                    onmouseenter={() => (hoveredInstanceId = id)}
+                    onmouseleave={() => (hoveredInstanceId = null)}
+                    onclick={() => {
+                      if (
+                        instanceModelId &&
+                        instanceModelId !== "Unknown" &&
+                        instanceModelId !== "Unknown Model"
+                      ) {
+                        userForcedIdle = false;
+                        setSelectedChatModel(instanceModelId);
+                      }
+                    }}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        if (
+                          instanceModelId &&
+                          instanceModelId !== "Unknown" &&
+                          instanceModelId !== "Unknown Model"
+                        ) {
+                          setSelectedChatModel(instanceModelId);
+                        }
+                      }
+                    }}
+                  >
+                    <!-- Corner accents -->
+                    <div
+                      class="absolute -top-px -left-px w-2 h-2 border-l border-t {statusColors.corner}"
+                    ></div>
+                    <div
+                      class="absolute -top-px -right-px w-2 h-2 border-r border-t {statusColors.corner}"
+                    ></div>
+                    <div
+                      class="absolute -bottom-px -left-px w-2 h-2 border-l border-b {statusColors.corner}"
+                    ></div>
+                    <div
+                      class="absolute -bottom-px -right-px w-2 h-2 border-r border-b {statusColors.corner}"
+                    ></div>
+
+                    <div
+                      class="bg-exo-dark-gray/60 border border-l-2 transition-all duration-200 group-hover:bg-exo-dark-gray/80 {statusColors.card} p-3"
+                    >
+                      <div class="flex justify-between items-start mb-2 pl-2">
+                        <div class="flex items-center gap-2 min-w-0">
+                          <div
+                            class="w-1.5 h-1.5 flex-shrink-0 {statusColors.dot} rounded-full shadow-[0_0_6px_currentColor]"
+                          ></div>
+                          <span
+                            class="text-exo-yellow font-mono text-sm truncate"
+                            title={instanceModelId}>{instanceModelName}</span
+                          >
+                          {#if getModelQuantization(instanceModelId)}
+                            <span
+                              class="flex-shrink-0 text-white/40 font-mono text-[10px]"
+                              >{getModelQuantization(instanceModelId)}</span
+                            >
+                          {/if}
+                        </div>
+                        <button
+                          title="Stop this model. Downloaded files are kept."
+                          onclick={(e) => {
+                            // Don't let the card's handlers select the model being stopped
+                            e.stopPropagation();
+                            deleteInstance(id);
+                          }}
+                          onkeydown={(e) => e.stopPropagation()}
+                          class="flex-shrink-0 text-xs px-2 py-1 font-mono tracking-wider uppercase border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50 transition-all duration-200 cursor-pointer"
+                        >
+                          Stop
+                        </button>
+                      </div>
+                      <div class="pl-2">
+                        <div
+                          class="flex flex-wrap items-center gap-x-2 gap-y-1 text-white/60 text-xs font-mono"
+                        >
+                          <span
+                            >{instanceInfo.sharding} &middot; {instanceInfo.instanceType}</span
+                          >
+                          <span
+                            class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded transition-all duration-300 {statusColors.badge}"
+                          >
+                            {statusLabel}
+                          </span>
+                        </div>
+                        {#if runningNoteOf(instance)}
+                          <p class="mt-1 text-[11px] text-white/50 break-words">
+                            {runningNoteOf(instance)}
+                          </p>
+                        {/if}
+                        {#if instanceModelId && instanceModelId !== "Unknown" && instanceModelId !== "Unknown Model"}
+                          <a
+                            class="inline-flex items-center gap-1 text-[11px] text-white/60 hover:text-exo-yellow transition-colors mt-1"
+                            href={`https://huggingface.co/${instanceModelId}`}
+                            target="_blank"
+                            rel="noreferrer noopener"
+                            aria-label="View model on Hugging Face"
+                          >
+                            <span>Hugging Face</span>
+                            <svg
+                              class="w-3.5 h-3.5"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                            >
+                              <path d="M14 3h7v7" />
+                              <path d="M10 14l11-11" />
+                              <path
+                                d="M21 14v6a1 1 0 0 1-1 1h-16a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1h6"
+                              />
+                            </svg>
+                          </a>
+                        {/if}
+                        {#if instanceInfo.nodeNames.length > 0}
+                          <div class="text-white/60 text-xs font-mono">
+                            {instanceInfo.nodeNames.join(", ")}
+                          </div>
+                        {/if}
+                        <div
+                          class="text-white/40 text-[10px] font-mono tracking-wider"
+                          title="Instance {id}"
+                        >
+                          ID {id.slice(0, 8).toUpperCase()}
+                        </div>
+                        {#if debugEnabled && instanceConnections.length > 0}
+                          <div class="mt-2 space-y-1">
+                            {#each instanceConnections as conn}
+                              <div
+                                class="text-[11px] leading-snug font-mono text-white/70"
+                              >
+                                <span>{conn.from} -> {conn.to}: {conn.ip}</span>
+                                <span
+                                  class={conn.missingIface
+                                    ? "text-red-400"
+                                    : "text-white/60"}
+                                >
+                                  ({conn.ifaceLabel})</span
+                                >
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+
+                        <!-- Download Progress -->
+                        {#if downloadInfo.isDownloading && downloadInfo.progress}
+                          <div class="mt-2 space-y-1">
+                            <div class="flex justify-between text-xs font-mono">
+                              <span class="text-blue-400"
+                                >{downloadInfo.progress.percentage.toFixed(
+                                  1,
+                                )}%</span
+                              >
+                              <span class="text-exo-light-gray"
+                                >{formatBytes(
+                                  downloadInfo.progress.downloadedBytes,
+                                )}/{formatBytes(
+                                  downloadInfo.progress.totalBytes,
+                                )}</span
+                              >
+                            </div>
+                            <div
+                              class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                            >
+                              <div
+                                class="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
+                                style="width: {downloadInfo.progress
+                                  .percentage}%"
+                              ></div>
+                            </div>
+                            <div
+                              class="flex justify-between text-xs font-mono text-exo-light-gray"
+                            >
+                              <span
+                                class={downloadInfo.progress.stalled
+                                  ? "text-orange-400"
+                                  : ""}
+                                >{downloadSpeedText(
+                                  downloadInfo.progress,
+                                )}</span
+                              >
+                              <span
+                                >ETA: {downloadEtaText(
+                                  downloadInfo.progress,
+                                )}</span
+                              >
+                              {#if !downloadInfo.progress.stalled}
+                                <span
+                                  >{downloadInfo.progress
+                                    .completedFiles}/{downloadInfo.progress
+                                    .totalFiles} files</span
+                                >
+                              {/if}
+                            </div>
+                          </div>
+                          {#if downloadInfo.perNode.length > 0}
+                            <div
+                              class="mt-2 space-y-2 max-h-48 overflow-y-auto pr-1"
+                            >
+                              {#each downloadInfo.perNode.filter((n) => n.status === "downloading" && n.progress) as nodeProg}
+                                {@const nodePercent = Math.min(
+                                  100,
+                                  Math.max(0, nodeProg.percentage),
+                                )}
+                                {@const isExpanded =
+                                  instanceDownloadExpandedNodes.has(
+                                    nodeProg.nodeId,
+                                  )}
+                                <div
+                                  class="rounded border border-exo-medium-gray/40 bg-exo-black/30 p-2"
+                                >
+                                  <button
+                                    type="button"
+                                    class="w-full text-left space-y-1.5"
+                                    onclick={() =>
+                                      toggleInstanceDownloadDetails(
+                                        nodeProg.nodeId,
+                                      )}
+                                  >
+                                    <div
+                                      class="flex items-center justify-between text-[11px] font-mono text-exo-light-gray"
+                                    >
+                                      <span class="text-white/80 truncate pr-2"
+                                        >{nodeProg.nodeName}</span
+                                      >
+                                      <span
+                                        class="flex items-center gap-1 text-blue-300"
+                                      >
+                                        {nodePercent.toFixed(1)}%
+                                        <svg
+                                          class="w-3 h-3 text-exo-light-gray"
+                                          viewBox="0 0 20 20"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          stroke-width="2"
+                                        >
+                                          <path
+                                            d="M6 8l4 4 4-4"
+                                            class={isExpanded
+                                              ? "transform rotate-180 origin-center transition-transform duration-150"
+                                              : "transition-transform duration-150"}
+                                          ></path>
+                                        </svg>
+                                      </span>
+                                    </div>
+                                    <div
+                                      class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                                    >
+                                      <div
+                                        class="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
+                                        style="width: {nodePercent.toFixed(1)}%"
+                                      ></div>
+                                    </div>
+                                    <div
+                                      class="flex items-center justify-between text-[11px] font-mono text-exo-light-gray"
+                                    >
+                                      <span
+                                        >{formatBytes(
+                                          nodeProg.progress?.downloadedBytes ??
+                                            0,
+                                        )} / {formatBytes(
+                                          nodeProg.progress?.totalBytes ?? 0,
+                                        )}</span
+                                      >
+                                      <span
+                                        class={nodeProg.progress?.stalled
+                                          ? "text-orange-400"
+                                          : ""}
+                                        >{nodeDownloadText(
+                                          nodeProg.progress,
+                                        )}</span
+                                      >
+                                    </div>
+                                  </button>
+
+                                  {#if isExpanded}
+                                    <div class="mt-2 space-y-1.5">
+                                      {#if (nodeProg.progress?.files ?? []).length === 0}
+                                        <div
+                                          class="text-[11px] font-mono text-exo-light-gray/70"
+                                        >
+                                          No file details reported.
+                                        </div>
+                                      {:else}
+                                        {#each nodeProg.progress?.files ?? [] as f}
+                                          {@const filePercent = Math.min(
+                                            100,
+                                            Math.max(0, f.percentage ?? 0),
+                                          )}
+                                          {@const isFileComplete =
+                                            filePercent >= 100}
+                                          <div
+                                            class="rounded border border-exo-medium-gray/30 bg-exo-black/40 p-2"
+                                          >
+                                            <div
+                                              class="flex items-center justify-between text-[10px] font-mono text-exo-light-gray/90"
+                                            >
+                                              <span class="truncate pr-2"
+                                                >{f.name}</span
+                                              >
+                                              <span
+                                                class={isFileComplete
+                                                  ? "text-green-400"
+                                                  : "text-white/80"}
+                                                >{filePercent.toFixed(1)}%</span
+                                              >
+                                            </div>
+                                            <div
+                                              class="relative h-1 bg-exo-black/60 rounded-sm overflow-hidden mt-1"
+                                            >
+                                              <div
+                                                class="absolute inset-y-0 left-0 bg-gradient-to-r {isFileComplete
+                                                  ? 'from-green-500 to-green-400'
+                                                  : 'from-exo-yellow to-exo-yellow/70'} transition-all duration-300"
+                                                style="width: {filePercent.toFixed(
+                                                  1,
+                                                )}%"
+                                              ></div>
+                                            </div>
+                                            <div
+                                              class="flex items-center justify-between text-[10px] text-exo-light-gray/70 mt-0.5"
+                                            >
+                                              <span
+                                                >{formatBytes(
+                                                  f.downloadedBytes,
+                                                )} / {formatBytes(
+                                                  f.totalBytes,
+                                                )}</span
+                                              >
+                                              <span
+                                                >{formatSpeed(f.speed)} • ETA {formatEta(
+                                                  f.etaMs,
+                                                )}</span
+                                              >
+                                            </div>
+                                          </div>
+                                        {/each}
+                                      {/if}
+                                    </div>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+                          <div class="mt-2 space-y-1">
+                            <div
+                              class="text-xs text-blue-400 font-mono tracking-wider uppercase"
+                            >
+                              Downloading
+                            </div>
+                            <p
+                              class="text-[11px] text-white/50 leading-relaxed"
+                            >
+                              EXO downloads the model to your devices before you
+                              can chat with it.
+                            </p>
+                          </div>
+                        {:else}
+                          <div class="mt-1 space-y-1">
+                            <div
+                              class="text-xs {statusColors.text} font-mono tracking-wider uppercase"
+                            >
+                              {statusLabel}
+                              {#if debugEnabled && statusText !== statusLabel.toUpperCase()}
+                                <span class="text-white/40">({statusText})</span
+                                >
+                              {/if}
+                            </div>
+                            {#if isLoading}
+                              {@const loadStatus =
+                                deriveInstanceStatus(instance)}
+                              {#if loadStatus.totalLayers && loadStatus.totalLayers > 0}
+                                <div class="mt-1 space-y-1">
+                                  <div
+                                    class="flex justify-between text-xs font-mono"
+                                  >
+                                    <span class="text-yellow-400"
+                                      >{(
+                                        ((loadStatus.layersLoaded ?? 0) /
+                                          loadStatus.totalLayers) *
+                                        100
+                                      ).toFixed(0)}%</span
+                                    >
+                                    <span class="text-exo-light-gray"
+                                      >{loadStatus.layersLoaded ?? 0} / {loadStatus.totalLayers}
+                                      layers</span
+                                    >
+                                  </div>
+                                  <div
+                                    class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                                  >
+                                    <div
+                                      class="absolute inset-y-0 left-0 bg-gradient-to-r from-yellow-500 to-yellow-400 transition-all duration-300"
+                                      style="width: {((loadStatus.layersLoaded ??
+                                        0) /
+                                        loadStatus.totalLayers) *
+                                        100}%"
+                                    ></div>
+                                  </div>
+                                </div>
+                              {:else}
+                                <p
+                                  class="text-[11px] text-white/50 leading-relaxed"
+                                >
+                                  Loading into memory…
+                                </p>
+                              {/if}
+                            {:else if isWarmingUp}
+                              <p
+                                class="text-[11px] text-white/50 leading-relaxed"
+                              >
+                                Almost ready…
+                              </p>
+                            {:else if statusLabel === "Ready"}
+                              <p
+                                class="text-[11px] text-green-400/70 leading-relaxed"
+                              >
+                                Ready to chat!
+                              </p>
+                            {:else if healthNote}
+                              <p
+                                class="text-[11px] text-orange-300/80 leading-relaxed"
+                                data-testid="instance-health"
+                              >
+                                {healthNote.message}
+                              </p>
+                            {/if}
+                          </div>
+                          {#if downloadInfo.isFailed && downloadInfo.errorMessage}
+                            <div
+                              class="text-xs text-red-400/80 font-mono mt-1 break-words whitespace-pre-line line-clamp-3"
+                              title={downloadInfo.errorMessage}
+                            >
+                              {summarizeFailureReason(
+                                downloadInfo.errorMessage,
+                              )}
+                            </div>
+                          {/if}
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <!-- Models Panel - Scrollable -->
+          <div class="p-4 flex-1 overflow-y-auto">
+            <!-- Panel Header -->
+            <div class="flex items-center gap-2 mb-3 flex-shrink-0">
+              <div class="w-2 h-2 border border-exo-yellow/60 rotate-45"></div>
+              <h3
+                class="text-xs text-exo-yellow font-mono tracking-[0.2em] uppercase"
+              >
+                Start a model
+              </h3>
+              <div
+                class="flex-1 h-px bg-gradient-to-r from-exo-yellow/30 to-transparent"
+              ></div>
+              <span class="text-sm text-white/70 font-mono"
+                >{models.length} models</span
+              >
+            </div>
+
+            <!-- Model Picker Button -->
+            <div class="flex-shrink-0 mb-3">
+              <button
+                type="button"
+                onclick={() => {
+                  modelPickerContext = "dashboard";
+                  isModelPickerOpen = true;
+                }}
+                class="w-full bg-exo-medium-gray/50 border border-exo-yellow/30 rounded pl-3 pr-8 py-2.5 text-sm font-mono text-left tracking-wide cursor-pointer transition-all duration-200 hover:border-exo-yellow/50 focus:outline-none focus:border-exo-yellow/70 relative"
+              >
+                {#if selectedModelId}
+                  {@const foundModel = models.find(
+                    (m) => m.id === selectedModelId,
+                  )}
+                  {#if foundModel}
+                    {@const sizeGB = getModelSizeGB(foundModel)}
+                    <span
+                      class="flex items-center justify-between gap-2 w-full pr-4"
+                    >
+                      <span
+                        class="flex items-center gap-2 text-exo-light-gray truncate"
+                      >
+                        <span class="truncate"
+                          >{getModelDisplayName(
+                            foundModel.id,
+                          )}{foundModel.quantization
+                            ? ` · ${foundModel.quantization}`
+                            : ""}</span
+                        >
+                      </span>
+                      <span class="text-white/50 text-xs flex-shrink-0"
+                        >{sizeGB >= 1
+                          ? sizeGB.toFixed(0)
+                          : sizeGB.toFixed(1)}GB</span
+                      >
+                    </span>
+                  {:else}
+                    <span class="text-exo-light-gray">{selectedModelId}</span>
+                  {/if}
+                {:else if bestRunningModelId}
+                  {@const runModel = models.find(
+                    (m) => m.id === bestRunningModelId,
+                  )}
+                  {#if runModel}
+                    {@const sizeGB = getModelSizeGB(runModel)}
+                    <span
+                      class="flex items-center justify-between gap-2 w-full pr-4"
+                    >
+                      <span
+                        class="flex items-center gap-2 text-exo-light-gray truncate"
+                      >
+                        <span class="truncate"
+                          >{getModelDisplayName(
+                            runModel.id,
+                          )}{runModel.quantization
+                            ? ` · ${runModel.quantization}`
+                            : ""}</span
+                        >
+                      </span>
+                      <span class="text-white/50 text-xs flex-shrink-0"
+                        >{sizeGB >= 1
+                          ? sizeGB.toFixed(0)
+                          : sizeGB.toFixed(1)}GB</span
+                      >
+                    </span>
+                  {:else}
+                    <span class="text-exo-light-gray">{bestRunningModelId}</span
+                    >
+                  {/if}
+                {:else}
+                  <span class="text-white/50">— SELECT MODEL —</span>
+                {/if}
+                <div
+                  class="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                >
+                  <svg
+                    class="w-4 h-4 text-exo-yellow/60"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M19 9l-7 7-7-7"
+                    />
+                  </svg>
+                </div>
+              </button>
+            </div>
+
+            <!-- Advanced Options Toggle -->
+            <div class="flex-shrink-0 mb-4">
+              <button
+                type="button"
+                onclick={() => (showAdvancedOptions = !showAdvancedOptions)}
+                class="flex flex-wrap items-center gap-2 text-xs text-white/50 hover:text-white/70 font-mono tracking-wider uppercase transition-colors cursor-pointer py-1"
+                aria-expanded={showAdvancedOptions}
+              >
+                <svg
+                  class="w-3 h-3 transition-transform duration-200 {showAdvancedOptions
+                    ? 'rotate-90'
+                    : ''}"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M9 5l7 7-7 7"
+                  />
+                </svg>
+                <span class="whitespace-nowrap">Advanced Options</span>
+                {#if !showAdvancedOptions && customLaunchSettingsLabel}
+                  <span
+                    class="normal-case tracking-normal text-left text-exo-yellow/80 border border-exo-yellow/30 rounded px-1.5 py-0.5"
+                    title="Your saved settings for starting a model"
+                  >
+                    {customLaunchSettingsLabel}
+                  </span>
+                {/if}
+              </button>
+
+              {#if showAdvancedOptions}
+                <div class="mt-3 space-y-3 pl-1" in:fade={{ duration: 150 }}>
+                  <!-- Split by (sharding) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Split by:
+                    </div>
+                    <div class="flex gap-2">
+                      <button
+                        onclick={() => {
+                          selectedSharding = "Pipeline";
+                          saveLaunchDefaults();
+                        }}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
+                        'Pipeline'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                          'Pipeline'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedSharding === "Pipeline"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        Pipeline
+                      </button>
+                      <button
+                        onclick={() => {
+                          selectedSharding = "Tensor";
+                          saveLaunchDefaults();
+                        }}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
+                        'Tensor'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
+                          'Tensor'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedSharding === "Tensor"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        Tensor
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- Connection (instance type) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Connection:
+                    </div>
+                    <div class="flex flex-wrap gap-2 whitespace-nowrap">
+                      <button
+                        onclick={() => {
+                          selectedInstanceType = "MlxRing";
+                          saveLaunchDefaults();
+                        }}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
+                        'MlxRing'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                          'MlxRing'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedInstanceType === "MlxRing"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {RUNTIME_LABELS.MlxRing}
+                      </button>
+                      <button
+                        onclick={() => {
+                          selectedInstanceType = "MlxJaccl";
+                          saveLaunchDefaults();
+                        }}
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
+                        'MlxJaccl'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                          'MlxJaccl'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedInstanceType === "MlxJaccl"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        {RUNTIME_LABELS.MlxJaccl}
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- Devices to use (minimum nodes) -->
+                  <div>
+                    <div class="text-xs text-white/50 font-mono mb-2">
+                      Devices to use:
+                    </div>
+                    <!-- Discrete slider track with drag support -->
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <div
+                      bind:this={sliderTrackElement}
+                      class="relative h-16 cursor-pointer select-none px-2 pr-6"
+                      onmousedown={handleSliderMouseDown}
+                      ontouchstart={handleSliderTouchStart}
+                    >
+                      <!-- Track background -->
+                      <div
+                        class="absolute top-6 left-0 right-0 h-2 bg-exo-medium-gray/50 rounded-full"
+                      ></div>
+                      <!-- Active track (fills up to selected) -->
+                      {#if availableMinNodes > 1}
+                        <div
+                          class="absolute top-6 left-0 h-2 bg-white/30 rounded-full transition-all pointer-events-none"
+                          style="width: {((selectedMinNodes - 1) /
+                            (availableMinNodes - 1)) *
+                            100}%"
+                        ></div>
+                      {/if}
+                      <!-- Dots and labels for each device count -->
+                      {#each Array.from({ length: availableMinNodes }, (_, i) => i + 1) as n}
+                        {@const isValid = validMinNodeCounts().has(n)}
+                        {@const isSelected = selectedMinNodes === n}
+                        {@const position =
+                          availableMinNodes > 1
+                            ? ((n - 1) / (availableMinNodes - 1)) * 100
+                            : 50}
+                        <div
+                          class="absolute flex flex-col items-center pointer-events-none"
+                          style="left: {position}%; top: 0; transform: translateX(-50%);"
+                        >
+                          <span
+                            class="rounded-full transition-all {isSelected
+                              ? 'w-6 h-6 bg-exo-yellow shadow-[0_0_10px_color-mix(in_srgb,var(--exo-yellow)_60%,transparent)]'
+                              : isValid
+                                ? 'w-4 h-4 bg-exo-light-gray/70 mt-1'
+                                : 'w-3 h-3 bg-exo-medium-gray/50 mt-1.5'}"
+                          ></span>
+                          <span
+                            class="text-sm font-mono mt-1.5 tabular-nums transition-colors {isSelected
+                              ? 'text-exo-yellow font-bold'
+                              : isValid
+                                ? 'text-white/70'
+                                : 'text-white/30'}">{n}</span
+                          >
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Selected Model Preview -->
+            <div class="space-y-3">
+              {#if models.length === 0}
+                <div class="text-center py-8">
+                  <div
+                    class="text-xs text-white/70 font-mono tracking-wider uppercase"
+                  >
+                    Loading models...
+                  </div>
+                </div>
+              {:else if loadingPreviews}
+                <div class="text-center py-8">
+                  <div
+                    class="text-xs text-exo-yellow font-mono tracking-wider uppercase animate-pulse"
+                  >
+                    Loading preview...
+                  </div>
+                </div>
+              {:else}
+                {@const selectedModel = models.find(
+                  (m) => m.id === selectedModelId,
+                )}
+                {@const allPreviews = filteredPreviews()}
+                {#if selectedModel && allPreviews.length > 0}
+                  {@const tags = modelTags()[selectedModel.id] || []}
+                  <div class="space-y-3">
+                    {#each allPreviews as apiPreview, i}
+                      {@const downloadStatus = getModelDownloadStatus(
+                        selectedModel.id,
+                        apiPreview.memory_delta_by_node
+                          ? Object.keys(apiPreview.memory_delta_by_node)
+                          : undefined,
+                      )}
+                      <div
+                        role="group"
+                        onmouseenter={() => {
+                          if (apiPreview.memory_delta_by_node) {
+                            hoveredPreviewNodes = new Set(
+                              Object.entries(apiPreview.memory_delta_by_node)
+                                .filter(([, delta]) => (delta ?? 0) > 0)
+                                .map(([nodeId]) => nodeId),
+                            );
+                          }
+                        }}
+                        onmouseleave={() => (hoveredPreviewNodes = new Set())}
+                      >
+                        <ModelCard
+                          model={selectedModel}
+                          isLaunching={launchingModelId === selectedModel.id}
+                          existingInstance={hasRunningInstance(selectedModel.id)
+                            ? "running"
+                            : hasExistingInstance(selectedModel.id)
+                              ? "starting"
+                              : null}
+                          {downloadStatus}
+                          nodes={data?.nodes ?? {}}
+                          sharding={apiPreview.sharding}
+                          runtime={apiPreview.instance_meta}
+                          onLaunch={() =>
+                            launchInstance(selectedModel.id, apiPreview)}
+                          {tags}
+                          {apiPreview}
+                          modelIdOverride={apiPreview.model_id}
+                        />
+                      </div>
+                    {/each}
+                  </div>
+                {:else if selectedModel}
+                  <div class="text-center py-4 space-y-3">
+                    <div class="text-xs text-white/50 font-mono">
+                      {placementMismatch?.reason ??
+                        "No valid configurations for current settings"}
+                    </div>
+                    {#if placementMismatch?.alternative}
+                      {@const alternative = placementMismatch.alternative}
+                      <button
+                        type="button"
+                        onclick={() =>
+                          useLaunchSettings(
+                            alternative.sharding,
+                            alternative.runtime,
+                          )}
+                        class="text-xs font-mono px-3 py-1.5 border border-exo-yellow/40 text-exo-yellow rounded hover:bg-exo-yellow/10 transition-colors cursor-pointer"
+                      >
+                        Use {alternative.sharding} · {RUNTIME_LABELS[
+                          alternative.runtime
+                        ]}
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              {/if}
+            </div>
+          </div>
+        {/snippet}
+      </div>
+    {:else}
+      <!-- CHAT STATE: Chat + Mini-Map -->
+      <div class="flex-1 flex overflow-hidden">
+        <!-- Chat Area -->
+        <div
+          class="flex-1 flex flex-col min-w-0 overflow-hidden"
+          in:fade={{ duration: 300, delay: 100 }}
+        >
+          {#if chatLaunchState !== "idle" && chatLaunchState !== "ready"}
+            <!-- Model launching/downloading/loading: show progress -->
+            <div class="flex-1 flex items-center justify-center px-8 py-6">
+              <div class="flex flex-col items-center gap-6 max-w-md w-full">
+                <!-- Model name -->
+                {#if pendingChatModelId}
+                  <p class="text-sm text-white font-mono tracking-wide">
+                    {getModelDisplayName(pendingChatModelId)}
+                  </p>
+                {/if}
+
+                {#if chatLaunchState === "launching"}
+                  <div class="flex flex-col items-center gap-3">
+                    <div
+                      class="w-8 h-8 border-2 border-exo-yellow/30 border-t-exo-yellow rounded-full animate-spin"
+                    ></div>
+                    <p
+                      class="text-xs text-exo-light-gray font-mono uppercase tracking-wider"
+                    >
+                      Starting&hellip;
+                    </p>
+                  </div>
+                {:else if chatLaunchState === "downloading"}
+                  <div class="w-full flex flex-col gap-3">
+                    <div
+                      class="flex items-center justify-between text-xs font-mono"
+                    >
+                      <span class="text-blue-400 uppercase tracking-wider"
+                        >Downloading</span
+                      >
+                      {#if chatLaunchDownload}
+                        <span class="text-exo-light-gray tabular-nums">
+                          {chatLaunchDownload.percentage.toFixed(1)}%
+                        </span>
+                      {/if}
+                    </div>
+                    <div
+                      class="w-full h-2 bg-exo-dark-gray rounded-full overflow-hidden border border-exo-medium-gray/30"
+                    >
+                      <div
+                        class="h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full transition-all duration-300"
+                        style="width: {chatLaunchDownload?.percentage ?? 0}%"
+                      ></div>
+                    </div>
+                    {#if chatLaunchDownload}
+                      <div
+                        class="flex justify-between text-[10px] text-exo-light-gray/60 font-mono"
+                      >
+                        <span
+                          >{formatBytes(chatLaunchDownload.downloadedBytes)} / {formatBytes(
+                            chatLaunchDownload.totalBytes,
+                          )}</span
+                        >
+                        <span>
+                          {#if chatLaunchDownload.stalled}
+                            Stalled
+                          {:else}
+                            {#if chatLaunchDownload.speed > 0}
+                              {formatBytes(chatLaunchDownload.speed)}/s
+                            {/if}
+                            {#if chatLaunchDownload.etaMs > 0}
+                              &middot; {formatEta(chatLaunchDownload.etaMs)}
+                            {/if}
+                          {/if}
+                        </span>
+                      </div>
+                    {/if}
+                  </div>
+                {:else if chatLaunchState === "loading"}
+                  <div class="w-full flex flex-col gap-3">
+                    <div
+                      class="flex items-center justify-between text-xs font-mono"
+                    >
+                      <span class="text-exo-yellow uppercase tracking-wider"
+                        >Loading into memory</span
+                      >
+                      {#if chatLaunchLoadProgress}
+                        <span class="text-exo-light-gray tabular-nums">
+                          {chatLaunchLoadProgress.layersLoaded}/{chatLaunchLoadProgress.totalLayers}
+                          layers
+                        </span>
+                      {/if}
+                    </div>
+                    <div
+                      class="w-full h-2 bg-exo-dark-gray rounded-full overflow-hidden border border-exo-medium-gray/30"
+                    >
+                      <div
+                        class="h-full bg-gradient-to-r from-exo-yellow/80 to-exo-yellow rounded-full transition-all duration-300"
+                        style="width: {chatLaunchLoadProgress?.percentage ??
+                          0}%"
+                      ></div>
+                    </div>
+                  </div>
+                {/if}
+
+                {#if pendingAutoMessage}
+                  {@const attachmentCount =
+                    pendingAutoMessage.files?.length ?? 0}
+                  <!-- Queued message, sent automatically once the model is ready -->
+                  <div class="w-full flex flex-col items-end gap-1.5">
+                    <div
+                      class="command-panel rounded-lg rounded-tr-sm px-4 py-3 max-w-full"
+                    >
+                      <p
+                        class="text-sm text-white/80 whitespace-pre-wrap break-words line-clamp-4"
+                      >
+                        {pendingAutoMessage.content}
+                      </p>
+                      {#if attachmentCount > 0}
+                        <p
+                          class="text-[10px] text-exo-light-gray/60 font-mono mt-1"
+                        >
+                          + {attachmentCount}
+                          {attachmentCount === 1 ? "attachment" : "attachments"}
+                        </p>
+                      {/if}
+                    </div>
+                    <div
+                      class="flex items-center gap-3 text-[10px] font-mono uppercase tracking-wider text-exo-light-gray/60"
+                    >
+                      <span>Sends when the model is ready</span>
+                      <button
+                        type="button"
+                        onclick={returnQueuedMessageToInput}
+                        class="uppercase text-exo-light-gray hover:text-exo-yellow transition-colors cursor-pointer"
+                        title="Put the message back in the input"
+                      >
+                        Don't send
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            </div>
+            <div
+              class="flex-shrink-0 px-8 pb-6 pt-4 bg-gradient-to-t from-exo-black via-exo-black to-transparent"
+            >
+              <div class="max-w-7xl mx-auto">
+                <ChatForm
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
+                  placeholder="Ask anything"
+                  showModelSelector={true}
+                  modelTasks={modelTasks()}
+                  modelCapabilities={modelCapabilities()}
+                  onAutoSend={handleChatSend}
+                  onOpenModelPicker={openChatModelPicker}
+                />
+              </div>
+            </div>
+          {:else if messages().length > 0 || chatLaunchState === "ready"}
+            <!-- Normal chat: show messages -->
+            <div
+              class="flex-1 overflow-y-auto px-8 py-6"
+              bind:this={chatScrollRef}
+              role="log"
+              aria-live="polite"
+              aria-label="Chat messages"
+            >
+              <div class="max-w-7xl mx-auto">
+                <ChatMessages scrollParent={chatScrollRef} />
+                {#if chatLaunchState === "ready" && selectedChatCategory}
+                  {@const prompts =
+                    categorySuggestedPrompts[selectedChatCategory] ??
+                    categorySuggestedPrompts.auto}
+                  <div
+                    class="flex flex-col items-center gap-4 mt-12"
+                    in:fade={{ duration: 300 }}
+                  >
+                    <p
+                      class="text-xs text-exo-light-gray/60 font-mono uppercase tracking-wider"
+                    >
+                      Try asking
+                    </p>
+                    <div class="grid grid-cols-2 gap-2 max-w-lg w-full">
+                      {#each prompts as prompt}
+                        <button
+                          type="button"
+                          onclick={() => {
+                            chatLaunchState = "idle";
+                            selectedChatCategory = null;
+                            handleChatSend(prompt);
+                          }}
+                          class="text-left px-3 py-2.5 text-xs text-exo-light-gray hover:text-white font-mono rounded-lg border border-exo-medium-gray/30 hover:border-exo-yellow/30 bg-exo-dark-gray/30 hover:bg-exo-dark-gray/60 transition-all duration-200 cursor-pointer"
+                        >
+                          {prompt}
+                        </button>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            </div>
+            <div
+              class="flex-shrink-0 px-8 pb-6 pt-4 bg-gradient-to-t from-exo-black via-exo-black to-transparent"
+            >
+              <div class="max-w-7xl mx-auto">
+                <ChatForm
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
+                  placeholder="Ask anything"
+                  showModelSelector={true}
+                  modelTasks={modelTasks()}
+                  modelCapabilities={modelCapabilities()}
+                  onAutoSend={handleChatSend}
+                  onOpenModelPicker={openChatModelPicker}
+                />
+              </div>
+            </div>
+          {:else}
+            <!-- No running instance, no messages: show model selector -->
+            <div
+              class="flex-1 overflow-y-auto flex items-center justify-center px-8 py-6"
+            >
+              <ChatModelSelector
+                models={models.filter(canDownloadModel).map((m) => ({
+                  id: m.id,
+                  name: m.name ?? "",
+                  base_model: m.base_model ?? "",
+                  storage_size_megabytes: m.storage_size_megabytes ?? 0,
+                  capabilities: m.capabilities ?? [],
+                  family: m.family ?? "",
+                  quantization: m.quantization ?? "",
+                }))}
+                clusterLabel={chatClusterLabel}
+                totalMemoryGB={availableMemoryGB()}
+                modelStatus={chatModelStatus}
+                onSelect={handleChatModelSelect}
+                onAddModel={handleChatAddModel}
+              />
+            </div>
+            <div
+              class="flex-shrink-0 px-8 pb-6 pt-4 bg-gradient-to-t from-exo-black via-exo-black to-transparent"
+            >
+              <div class="max-w-7xl mx-auto">
+                <ChatForm
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
+                  placeholder={bestRunningModelId
+                    ? "Ask anything"
+                    : "Ask anything — we'll pick the best model automatically"}
+                  showModelSelector={!!bestRunningModelId}
+                  modelDisplayOverride={bestRunningModelId ?? undefined}
+                  modelTasks={modelTasks()}
+                  modelCapabilities={modelCapabilities()}
+                  onAutoSend={handleChatSend}
+                  onOpenModelPicker={openChatModelPicker}
+                />
+              </div>
+            </div>
+          {/if}
+        </div>
+
+        <!-- Right: Mini-Map Sidebar - Desktop only -->
+        {#if minimized}
+          <aside
+            class="hidden md:flex w-80 border-l border-exo-yellow/20 bg-exo-dark-gray flex-col flex-shrink-0 overflow-y-auto"
+            in:fly={{ x: 100, duration: 400, easing: cubicInOut }}
+            aria-label="Cluster topology"
+          >
+            <!-- Topology Section - clickable to go back to main view -->
+            <button
+              class="p-4 border-b border-exo-medium-gray/30 w-full text-left cursor-pointer hover:bg-exo-medium-gray/10 transition-colors"
+              onclick={handleGoHome}
+              title="Click to return to main topology view"
+            >
+              <div class="flex items-center justify-between mb-3">
+                <div
+                  class="text-xs text-exo-yellow tracking-[0.2em] uppercase flex items-center gap-2"
+                >
+                  <span
+                    class="w-1.5 h-1.5 bg-exo-yellow rounded-full status-pulse"
+                  ></span>
+                  TOPOLOGY
+                </div>
+                <span class="text-xs text-white/70 tabular-nums"
+                  >{nodeCount} {nodeCount === 1 ? "DEVICE" : "DEVICES"}</span
+                >
+              </div>
+              {#if notRespondingCount > 0}
+                <div
+                  class="-mt-2 mb-2 text-right text-[11px] text-orange-400 tabular-nums"
+                >
+                  {notRespondingCount} not responding
+                </div>
+              {/if}
+
+              <div
+                class="relative aspect-square bg-exo-dark-gray rounded-lg overflow-hidden pointer-events-none"
+              >
+                <TopologyGraph
+                  highlightedNodes={highlightedNodes()}
+                  filteredNodes={nodeFilter}
+                />
+
+                {@render clusterWarningsCompact()}
+              </div>
+            </button>
+
+            <!-- Instances Section (only shown when instances exist) -->
+            {#if instanceCount > 0 || pendingDeployments.length > 0}
+              <div class="p-4 flex-1">
+                <!-- Panel Header -->
+                <div class="flex items-center gap-2 mb-4">
+                  <div
+                    class="w-2 h-2 bg-exo-yellow rounded-full shadow-[0_0_8px_color-mix(in_srgb,var(--exo-yellow)_60%,transparent)] animate-pulse"
+                  ></div>
+                  <h3
+                    class="text-xs text-exo-yellow font-mono tracking-[0.2em] uppercase"
+                  >
+                    Running models
+                  </h3>
+                  <div
+                    class="flex-1 h-px bg-gradient-to-r from-exo-yellow/30 to-transparent"
+                  ></div>
+                </div>
+                <div
+                  class="space-y-3 max-h-72 xl:max-h-96 overflow-y-auto overflow-x-hidden py-px pr-1"
+                >
+                  {@render deploymentCards()}
+                  {#each Object.entries(instanceData) as [id, instance]}
+                    {@const downloadInfo = getInstanceDownloadStatus(
+                      id,
+                      instance,
+                    )}
+                    {@const healthNote = getInstanceHealthNote(
+                      instance,
+                      downloadInfo.statusText,
+                    )}
+                    {@const statusText =
+                      healthNote?.statusText ?? downloadInfo.statusText}
+                    {@const statusLabel = getInstanceStatusLabel(statusText)}
+                    {@const statusColors = STATUS_COLORS[statusLabel]}
+                    {@const isLoading = statusText === "LOADING"}
+                    {@const isWarmingUp = statusText === "WARMING UP"}
+                    <!-- Instance Card -->
+                    {@const instanceModelId = getInstanceModelId(instance)}
+                    {@const instanceModelName =
+                      getModelDisplayName(instanceModelId)}
+                    {@const instanceInfo = getInstanceInfo(instance)}
+                    {@const instanceConnections =
+                      getInstanceConnections(instance)}
+                    <div
+                      class="relative group cursor-pointer"
+                      role="button"
+                      tabindex="0"
+                      onmouseenter={() => (hoveredInstanceId = id)}
+                      onmouseleave={() => (hoveredInstanceId = null)}
+                      onclick={() => {
+                        if (
+                          instanceModelId &&
+                          instanceModelId !== "Unknown" &&
+                          instanceModelId !== "Unknown Model"
+                        ) {
+                          userForcedIdle = false;
+                          setSelectedChatModel(instanceModelId);
+                        }
+                      }}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          if (
+                            instanceModelId &&
+                            instanceModelId !== "Unknown" &&
+                            instanceModelId !== "Unknown Model"
+                          ) {
+                            setSelectedChatModel(instanceModelId);
+                          }
+                        }
+                      }}
+                    >
+                      <!-- Corner accents -->
+                      <div
+                        class="absolute -top-px -left-px w-2 h-2 border-l border-t {statusColors.corner}"
+                      ></div>
+                      <div
+                        class="absolute -top-px -right-px w-2 h-2 border-r border-t {statusColors.corner}"
+                      ></div>
+                      <div
+                        class="absolute -bottom-px -left-px w-2 h-2 border-l border-b {statusColors.corner}"
+                      ></div>
+                      <div
+                        class="absolute -bottom-px -right-px w-2 h-2 border-r border-b {statusColors.corner}"
+                      ></div>
+
+                      <div
+                        class="bg-exo-dark-gray/60 border border-l-2 {statusColors.card} p-3"
+                      >
+                        <div class="flex justify-between items-start mb-2 pl-2">
+                          <div class="flex items-center gap-2 min-w-0">
+                            <div
+                              class="w-1.5 h-1.5 flex-shrink-0 {statusColors.dot} rounded-full shadow-[0_0_6px_currentColor]"
+                            ></div>
+                            <span
+                              class="text-exo-yellow font-mono text-sm truncate"
+                              title={instanceModelId}>{instanceModelName}</span
+                            >
+                            {#if getModelQuantization(instanceModelId)}
+                              <span
+                                class="flex-shrink-0 text-white/40 font-mono text-[10px]"
+                                >{getModelQuantization(instanceModelId)}</span
+                              >
+                            {/if}
+                          </div>
+                          <button
+                            title="Stop this model. Downloaded files are kept."
+                            onclick={(e) => {
+                              // Don't let the card's handlers select the model being stopped
+                              e.stopPropagation();
+                              deleteInstance(id);
+                            }}
+                            onkeydown={(e) => e.stopPropagation()}
+                            class="flex-shrink-0 text-xs px-2 py-1 font-mono tracking-wider uppercase border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50 transition-all duration-200 cursor-pointer"
+                          >
+                            Stop
+                          </button>
+                        </div>
+                        <div class="pl-2">
+                          <div
+                            class="flex flex-wrap items-center gap-x-2 gap-y-1 text-white/60 text-xs font-mono"
+                          >
+                            <span
+                              >{instanceInfo.sharding} &middot; {instanceInfo.instanceType}</span
+                            >
+                            <span
+                              class="px-1.5 py-0.5 text-[10px] tracking-wider uppercase rounded transition-all duration-300 {statusColors.badge}"
+                            >
+                              {statusLabel}
+                            </span>
+                          </div>
+                          {#if runningNoteOf(instance)}
+                            <p
+                              class="mt-1 text-[11px] text-white/50 break-words"
+                            >
+                              {runningNoteOf(instance)}
+                            </p>
+                          {/if}
+                          {#if instanceModelId && instanceModelId !== "Unknown" && instanceModelId !== "Unknown Model"}
+                            <a
+                              class="inline-flex items-center gap-1 text-[11px] text-white/60 hover:text-exo-yellow transition-colors mt-1"
+                              href={`https://huggingface.co/${instanceModelId}`}
+                              target="_blank"
+                              rel="noreferrer noopener"
+                              aria-label="View model on Hugging Face"
+                            >
+                              <span>Hugging Face</span>
+                              <svg
+                                class="w-3.5 h-3.5"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                              >
+                                <path d="M14 3h7v7" />
+                                <path d="M10 14l11-11" />
+                                <path
+                                  d="M21 14v6a1 1 0 0 1-1 1h-16a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1h6"
+                                />
+                              </svg>
+                            </a>
+                          {/if}
+                          {#if instanceInfo.nodeNames.length > 0}
+                            <div class="text-white/60 text-xs font-mono">
+                              {instanceInfo.nodeNames.join(", ")}
+                            </div>
+                          {/if}
+                          <div
+                            class="text-white/40 text-[10px] font-mono tracking-wider"
+                            title="Instance {id}"
+                          >
+                            ID {id.slice(0, 8).toUpperCase()}
+                          </div>
+                          {#if debugEnabled && instanceConnections.length > 0}
+                            <div class="mt-2 space-y-1">
+                              {#each instanceConnections as conn}
+                                <div
+                                  class="text-[11px] leading-snug font-mono text-white/70"
+                                >
+                                  <span
+                                    >{conn.from} -> {conn.to}: {conn.ip}</span
+                                  >
+                                  <span
+                                    class={conn.missingIface
+                                      ? "text-red-400"
+                                      : "text-white/60"}
+                                  >
+                                    ({conn.ifaceLabel})</span
+                                  >
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+
+                          <!-- Download Progress -->
+                          {#if downloadInfo.isDownloading && downloadInfo.progress}
+                            <div class="mt-2 space-y-1">
+                              <div
+                                class="flex justify-between text-xs font-mono"
+                              >
+                                <span class="text-blue-400"
+                                  >{downloadInfo.progress.percentage.toFixed(
+                                    1,
+                                  )}%</span
+                                >
+                                <span class="text-exo-light-gray"
+                                  >{formatBytes(
+                                    downloadInfo.progress.downloadedBytes,
+                                  )}/{formatBytes(
+                                    downloadInfo.progress.totalBytes,
+                                  )}</span
+                                >
+                              </div>
+                              <div
+                                class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                              >
+                                <div
+                                  class="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
+                                  style="width: {downloadInfo.progress
+                                    .percentage}%"
+                                ></div>
+                              </div>
+                              <div
+                                class="flex justify-between text-xs font-mono text-exo-light-gray"
+                              >
+                                <span
+                                  class={downloadInfo.progress.stalled
+                                    ? "text-orange-400"
+                                    : ""}
+                                  >{downloadSpeedText(
+                                    downloadInfo.progress,
+                                  )}</span
+                                >
+                                <span
+                                  >ETA: {downloadEtaText(
+                                    downloadInfo.progress,
+                                  )}</span
+                                >
+                                {#if !downloadInfo.progress.stalled}
+                                  <span
+                                    >{downloadInfo.progress
+                                      .completedFiles}/{downloadInfo.progress
+                                      .totalFiles} files</span
+                                  >
+                                {/if}
+                              </div>
+                            </div>
+                            {#if downloadInfo.perNode.length > 0}
+                              <div
+                                class="mt-2 space-y-2 max-h-48 overflow-y-auto pr-1"
+                              >
+                                {#each downloadInfo.perNode.filter((n) => n.status === "downloading" && n.progress) as nodeProg}
+                                  {@const nodePercent = Math.min(
+                                    100,
+                                    Math.max(0, nodeProg.percentage),
+                                  )}
+                                  {@const isExpanded =
+                                    instanceDownloadExpandedNodes.has(
+                                      nodeProg.nodeId,
+                                    )}
+                                  <div
+                                    class="rounded border border-exo-medium-gray/40 bg-exo-black/30 p-2"
+                                  >
+                                    <button
+                                      type="button"
+                                      class="w-full text-left space-y-1.5"
+                                      onclick={() =>
+                                        toggleInstanceDownloadDetails(
+                                          nodeProg.nodeId,
+                                        )}
+                                    >
+                                      <div
+                                        class="flex items-center justify-between text-[11px] font-mono text-exo-light-gray"
+                                      >
+                                        <span
+                                          class="text-white/80 truncate pr-2"
+                                          >{nodeProg.nodeName}</span
+                                        >
+                                        <span
+                                          class="flex items-center gap-1 text-blue-300"
+                                        >
+                                          {nodePercent.toFixed(1)}%
+                                          <svg
+                                            class="w-3 h-3 text-exo-light-gray"
+                                            viewBox="0 0 20 20"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="2"
+                                          >
+                                            <path
+                                              d="M6 8l4 4 4-4"
+                                              class={isExpanded
+                                                ? "transform rotate-180 origin-center transition-transform duration-150"
+                                                : "transition-transform duration-150"}
+                                            ></path>
+                                          </svg>
+                                        </span>
+                                      </div>
+                                      <div
+                                        class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                                      >
+                                        <div
+                                          class="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-300"
+                                          style="width: {nodePercent.toFixed(
+                                            1,
+                                          )}%"
+                                        ></div>
+                                      </div>
+                                      <div
+                                        class="flex items-center justify-between text-[11px] font-mono text-exo-light-gray"
+                                      >
+                                        <span
+                                          >{formatBytes(
+                                            nodeProg.progress
+                                              ?.downloadedBytes ?? 0,
+                                          )} / {formatBytes(
+                                            nodeProg.progress?.totalBytes ?? 0,
+                                          )}</span
+                                        >
+                                        <span
+                                          class={nodeProg.progress?.stalled
+                                            ? "text-orange-400"
+                                            : ""}
+                                          >{nodeDownloadText(
+                                            nodeProg.progress,
+                                          )}</span
+                                        >
+                                      </div>
+                                    </button>
+
+                                    {#if isExpanded}
+                                      <div class="mt-2 space-y-1.5">
+                                        {#if (nodeProg.progress?.files ?? []).length === 0}
+                                          <div
+                                            class="text-[11px] font-mono text-exo-light-gray/70"
+                                          >
+                                            No file details reported.
+                                          </div>
+                                        {:else}
+                                          {#each nodeProg.progress?.files ?? [] as f}
+                                            {@const filePercent = Math.min(
+                                              100,
+                                              Math.max(0, f.percentage ?? 0),
+                                            )}
+                                            {@const isFileComplete =
+                                              filePercent >= 100}
+                                            <div
+                                              class="rounded border border-exo-medium-gray/30 bg-exo-black/40 p-2"
+                                            >
+                                              <div
+                                                class="flex items-center justify-between text-[10px] font-mono text-exo-light-gray/90"
+                                              >
+                                                <span class="truncate pr-2"
+                                                  >{f.name}</span
+                                                >
+                                                <span
+                                                  class={isFileComplete
+                                                    ? "text-green-400"
+                                                    : "text-white/80"}
+                                                  >{filePercent.toFixed(
+                                                    1,
+                                                  )}%</span
+                                                >
+                                              </div>
+                                              <div
+                                                class="relative h-1 bg-exo-black/60 rounded-sm overflow-hidden mt-1"
+                                              >
+                                                <div
+                                                  class="absolute inset-y-0 left-0 bg-gradient-to-r {isFileComplete
+                                                    ? 'from-green-500 to-green-400'
+                                                    : 'from-exo-yellow to-exo-yellow/70'} transition-all duration-300"
+                                                  style="width: {filePercent.toFixed(
+                                                    1,
+                                                  )}%"
+                                                ></div>
+                                              </div>
+                                              <div
+                                                class="flex items-center justify-between text-[10px] text-exo-light-gray/70 mt-0.5"
+                                              >
+                                                <span
+                                                  >{formatBytes(
+                                                    f.downloadedBytes,
+                                                  )} / {formatBytes(
+                                                    f.totalBytes,
+                                                  )}</span
+                                                >
+                                                <span
+                                                  >{formatSpeed(f.speed)} • ETA
+                                                  {formatEta(f.etaMs)}</span
+                                                >
+                                              </div>
+                                            </div>
+                                          {/each}
+                                        {/if}
+                                      </div>
+                                    {/if}
+                                  </div>
+                                {/each}
+                              </div>
+                            {/if}
+                            <div class="mt-2 space-y-1">
+                              <div
+                                class="text-xs text-blue-400 font-mono tracking-wider uppercase"
+                              >
+                                Downloading
+                              </div>
+                              <p
+                                class="text-[11px] text-white/50 leading-relaxed"
+                              >
+                                EXO downloads the model to your devices before
+                                you can chat with it.
+                              </p>
+                            </div>
+                          {:else}
+                            <div class="mt-1 space-y-1">
+                              <div
+                                class="text-xs {statusColors.text} font-mono tracking-wider uppercase"
+                              >
+                                {statusLabel}
+                                {#if debugEnabled && statusText !== statusLabel.toUpperCase()}
+                                  <span class="text-white/40"
+                                    >({statusText})</span
+                                  >
+                                {/if}
+                              </div>
+                              {#if isLoading}
+                                {@const loadStatus =
+                                  deriveInstanceStatus(instance)}
+                                {#if loadStatus.totalLayers && loadStatus.totalLayers > 0}
+                                  <div class="mt-1 space-y-1">
+                                    <div
+                                      class="flex justify-between text-xs font-mono"
+                                    >
+                                      <span class="text-yellow-400"
+                                        >{(
+                                          ((loadStatus.layersLoaded ?? 0) /
+                                            loadStatus.totalLayers) *
+                                          100
+                                        ).toFixed(0)}%</span
+                                      >
+                                      <span class="text-exo-light-gray"
+                                        >{loadStatus.layersLoaded ?? 0} / {loadStatus.totalLayers}
+                                        layers</span
+                                      >
+                                    </div>
+                                    <div
+                                      class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden"
+                                    >
+                                      <div
+                                        class="absolute inset-y-0 left-0 bg-gradient-to-r from-yellow-500 to-yellow-400 transition-all duration-300"
+                                        style="width: {((loadStatus.layersLoaded ??
+                                          0) /
+                                          loadStatus.totalLayers) *
+                                          100}%"
+                                      ></div>
+                                    </div>
+                                  </div>
+                                {:else}
+                                  <p
+                                    class="text-[11px] text-white/50 leading-relaxed"
+                                  >
+                                    Loading into memory…
+                                  </p>
+                                {/if}
+                              {:else if isWarmingUp}
+                                <p
+                                  class="text-[11px] text-white/50 leading-relaxed"
+                                >
+                                  Almost ready…
+                                </p>
+                              {:else if statusLabel === "Ready"}
+                                <p
+                                  class="text-[11px] text-green-400/70 leading-relaxed"
+                                >
+                                  Ready to chat!
+                                </p>
+                              {:else if healthNote}
+                                <p
+                                  class="text-[11px] text-orange-300/80 leading-relaxed"
+                                  data-testid="instance-health"
+                                >
+                                  {healthNote.message}
+                                </p>
+                              {/if}
+                            </div>
+                            {#if downloadInfo.isFailed && downloadInfo.errorMessage}
+                              <div
+                                class="text-xs text-red-400/80 font-mono mt-1 break-words whitespace-pre-line line-clamp-3"
+                                title={downloadInfo.errorMessage}
+                              >
+                                {summarizeFailureReason(
+                                  downloadInfo.errorMessage,
+                                )}
+                              </div>
+                            {/if}
+                          {/if}
+                        </div>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          </aside>
+        {/if}
+      </div>
+    {/if}
+  </main>
+</div>
+
+{#if !showOnboarding}
+  <ModelPickerModal
+    isOpen={isModelPickerOpen}
+    {models}
+    {selectedModelId}
+    favorites={favoritesSet}
+    {recentModelIds}
+    hasRecents={showRecentsTab}
+    existingModelIds={new Set(models.map((m) => m.id))}
+    canModelFit={(modelId) => {
+      const model = models.find((m) => m.id === modelId);
+      return model ? hasEnoughMemory(model) : false;
+    }}
+    getModelFitStatus={(modelId): ModelMemoryFitStatus => {
+      const model = models.find((m) => m.id === modelId);
+      return model ? getModelMemoryFitStatus(model) : "too_large";
+    }}
+    {getModelFitNote}
+    onSelect={(modelId) => {
+      if (modelPickerContext === "chat") {
+        handleChatPickerSelect(modelId);
+      } else {
+        handleModelPickerSelect(modelId);
+      }
+    }}
+    onClose={() => (isModelPickerOpen = false)}
+    onToggleFavorite={toggleFavorite}
+    onAddModel={addModelFromPicker}
+    onDeleteModel={deleteCustomModel}
+    totalMemoryGB={clusterMemory().total / (1024 * 1024 * 1024)}
+    usedMemoryGB={clusterMemory().used / (1024 * 1024 * 1024)}
+    {downloadsData}
+    topologyNodes={data?.nodes}
+    instanceStatuses={modelInstanceStatuses}
+  />
+{/if}

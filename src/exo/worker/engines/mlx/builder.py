@@ -1,0 +1,140 @@
+import contextlib
+import os
+from collections.abc import Generator
+from dataclasses import dataclass
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+from exo.download.download_utils import build_model_path
+from exo.shared.types.common import ModelId
+from exo.shared.types.events import RunnerEvent
+from exo.shared.types.tasks import TaskId
+from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.runner_response import ModelLoadingResponse
+from exo.utils.channels import MpReceiver, MpSender
+from exo.worker.engines.base import Builder, Engine
+from exo.worker.engines.mlx.models.registry import architecture_for_model
+from exo.worker.runner.bootstrap import logger
+from exo.worker.runner.context_length import read_model_context_length
+from exo.worker.runner.llm_inference.batch_generator import (
+    BatchGenerator,
+    SequentialGenerator,
+)
+from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
+
+from .cache import KVPrefixCache
+from .types import Model
+from .utils_mlx import (
+    initialize_mlx,
+    load_mlx_items,
+    use_generation_stream_by_default,
+)
+from .vision import VisionProcessor
+
+
+def generates_in_batches(model: nn.Module) -> bool:
+    """Whether requests share batched decode steps (BatchGenerator) or run one at a time
+    (SequentialGenerator): batching is off with EXO_NO_BATCH, or for a model family whose
+    cache can't be batched."""
+    if os.environ.get("EXO_NO_BATCH"):
+        return False
+    architecture = architecture_for_model(model)
+    return architecture is None or architecture.batched_generation
+
+
+@dataclass
+class MlxBuilder(Builder):
+    model_id: ModelId
+    event_sender: MpSender[RunnerEvent]
+    cancel_receiver: MpReceiver[TaskId]
+    inference_model: Model | None = None
+    tokenizer: TokenizerWrapper | None = None
+    group: mx.distributed.Group | None = None
+    vision_processor: VisionProcessor | None = None
+    # The longest context the loaded model takes; 0 if unknown
+    context_length: int = 0
+
+    def __post_init__(self) -> None:
+        use_generation_stream_by_default()
+
+    def connect(self, bound_instance: BoundInstance) -> None:
+        self.group = initialize_mlx(bound_instance)
+
+    def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
+        (
+            self.inference_model,
+            self.tokenizer,
+            self.vision_processor,
+        ) = yield from load_mlx_items(bound_instance, self.group)
+        card = bound_instance.bound_shard.model_card
+        self.context_length = read_model_context_length(
+            build_model_path(card.model_id), card.context_length
+        )
+        logger.info(f"model takes up to {self.context_length} tokens of context")
+
+    def close(self) -> None:
+        with contextlib.suppress(NameError, AttributeError):
+            del self.inference_model
+        with contextlib.suppress(NameError, AttributeError):
+            del self.tokenizer
+        with contextlib.suppress(NameError, AttributeError):
+            del self.group
+
+    def build(
+        self,
+    ) -> Engine:
+        assert self.inference_model
+        assert self.tokenizer
+
+        vision_processor = self.vision_processor
+
+        tool_parser = None
+        logger.info(
+            f"model has_tool_calling={self.tokenizer.has_tool_calling} using tokens {self.tokenizer.tool_call_start}, {self.tokenizer.tool_call_end}"
+        )
+        if (
+            self.tokenizer.tool_call_start
+            and self.tokenizer.tool_call_end
+            and self.tokenizer.tool_parser  # type: ignore
+        ):
+            tool_parser = make_mlx_parser(
+                self.tokenizer.tool_call_start,
+                self.tokenizer.tool_call_end,
+                self.tokenizer.tool_parser,  # type: ignore
+            )
+
+        kv_prefix_cache = KVPrefixCache(self.group)
+
+        device_rank = 0 if self.group is None else self.group.rank()
+        if not generates_in_batches(self.inference_model):
+            logger.info("using SequentialGenerator (batching disabled)")
+            return SequentialGenerator(
+                model=self.inference_model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                tool_parser=tool_parser,
+                kv_prefix_cache=kv_prefix_cache,
+                model_id=self.model_id,
+                device_rank=device_rank,
+                cancel_receiver=self.cancel_receiver,
+                event_sender=self.event_sender,
+                vision_processor=vision_processor,
+                context_length=self.context_length,
+            )
+        else:
+            logger.info("using BatchGenerator")
+            return BatchGenerator(
+                model=self.inference_model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                tool_parser=tool_parser,
+                kv_prefix_cache=kv_prefix_cache,
+                model_id=self.model_id,
+                device_rank=device_rank,
+                cancel_receiver=self.cancel_receiver,
+                event_sender=self.event_sender,
+                vision_processor=vision_processor,
+                context_length=self.context_length,
+            )

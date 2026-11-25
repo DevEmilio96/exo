@@ -1,0 +1,1272 @@
+from collections.abc import Mapping
+from datetime import datetime, timezone
+
+import pytest
+
+from exo.master.placement import (
+    memory_once_loaded,
+    place_instance,
+    removal_events,
+)
+from exo.master.tests.conftest import (
+    create_node_memory,
+    create_node_network,
+    create_rdma_connection,
+    create_socket_connection,
+)
+from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.topology import Topology
+from exo.shared.types.backends import Backend
+from exo.shared.types.common import NodeId
+from exo.shared.types.events import (
+    InstanceDeleted,
+)
+from exo.shared.types.memory import Memory
+from exo.shared.types.multiaddr import Multiaddr
+from exo.shared.types.placement import PlacementRequest
+from exo.shared.types.profiling import (
+    MemoryUsage,
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
+    NodeRdmaCtlStatus,
+)
+from exo.shared.types.topology import Connection, SocketConnection
+from exo.shared.types.worker.downloads import (
+    DownloadCompleted,
+    DownloadFailed,
+    DownloadOngoing,
+    DownloadProgressData,
+)
+from exo.shared.types.worker.instances import (
+    Instance,
+    InstanceId,
+    InstanceMeta,
+    MlxJacclInstance,
+    MlxRingInstance,
+)
+from exo.shared.types.worker.runners import (
+    RunnerConnecting,
+    RunnerFailed,
+    RunnerId,
+    RunnerIdle,
+    RunnerLoaded,
+    RunnerLoading,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShuttingDown,
+    RunnerStatus,
+    RunnerWarmingUp,
+    ShardAssignments,
+)
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
+
+AT = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def instance() -> Instance:
+    return MlxRingInstance(
+        instance_id=InstanceId(),
+        shard_assignments=ShardAssignments(
+            model_id=ModelId("test-model"), runner_to_shard={}, node_to_runner={}
+        ),
+        hosts_by_node={},
+        ephemeral_port=50000,
+    )
+
+
+@pytest.fixture
+def model_card() -> ModelCard:
+    return ModelCard(
+        model_id=ModelId("test-model"),
+        storage_size=Memory.from_kb(1000),
+        n_layers=10,
+        hidden_size=30,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+
+
+def _metal_only(
+    node_memory: Mapping[NodeId, object],
+) -> dict[NodeId, list[Backend]]:
+    return {node_id: [Backend.MlxMetal] for node_id in node_memory}
+
+
+def place_instance_command(model_card: ModelCard) -> PlacementRequest:
+    return PlacementRequest(
+        model_card=model_card,
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        min_nodes=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "available_memory,total_layers,expected_layers",
+    [
+        ((500, 500, 1000), 12, (3, 3, 6)),
+        ((500, 500, 500), 12, (4, 4, 4)),
+        ((312, 468, 1092), 12, (2, 3, 7)),
+    ],
+)
+def test_get_instance_placements_create_instance(
+    available_memory: tuple[int, int, int],
+    total_layers: int,
+    expected_layers: tuple[int, int, int],
+    model_card: ModelCard,
+):
+    # arrange
+    model_card = model_card.model_copy(
+        update={
+            "n_layers": total_layers,
+            "storage_size": Memory.from_bytes(
+                sum(available_memory)
+            ),  # make it exactly fit across all nodes
+        }
+    )
+    topology = Topology()
+
+    cic = place_instance_command(model_card)
+    node_id_a = NodeId()
+    node_id_b = NodeId()
+    node_id_c = NodeId()
+
+    # fully connected (directed) between the 3 nodes
+    conn_a_b = Connection(
+        source=node_id_a, sink=node_id_b, edge=create_socket_connection(1)
+    )
+    conn_b_c = Connection(
+        source=node_id_b, sink=node_id_c, edge=create_socket_connection(2)
+    )
+    conn_c_a = Connection(
+        source=node_id_c, sink=node_id_a, edge=create_socket_connection(3)
+    )
+    conn_c_b = Connection(
+        source=node_id_c, sink=node_id_b, edge=create_socket_connection(4)
+    )
+    conn_a_c = Connection(
+        source=node_id_a, sink=node_id_c, edge=create_socket_connection(5)
+    )
+    conn_b_a = Connection(
+        source=node_id_b, sink=node_id_a, edge=create_socket_connection(6)
+    )
+
+    node_memory = {
+        node_id_a: create_node_memory(available_memory[0]),
+        node_id_b: create_node_memory(available_memory[1]),
+        node_id_c: create_node_memory(available_memory[2]),
+    }
+    node_network = {
+        node_id_a: create_node_network(),
+        node_id_b: create_node_network(),
+        node_id_c: create_node_network(),
+    }
+    topology.add_node(node_id_a)
+    topology.add_node(node_id_b)
+    topology.add_node(node_id_c)
+    topology.add_connection(conn_a_b)
+    topology.add_connection(conn_b_c)
+    topology.add_connection(conn_c_a)
+    topology.add_connection(conn_c_b)
+    topology.add_connection(conn_a_c)
+    topology.add_connection(conn_b_a)
+
+    # act
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
+
+    # assert
+    assert len(placements) == 1
+    instance_id = list(placements.keys())[0]
+    instance = placements[instance_id]
+    assert instance.shard_assignments.model_id == model_card.model_id
+
+    runner_id_a = instance.shard_assignments.node_to_runner[node_id_a]
+    runner_id_b = instance.shard_assignments.node_to_runner[node_id_b]
+    runner_id_c = instance.shard_assignments.node_to_runner[node_id_c]
+
+    shard_a = instance.shard_assignments.runner_to_shard[runner_id_a]
+    shard_b = instance.shard_assignments.runner_to_shard[runner_id_b]
+    shard_c = instance.shard_assignments.runner_to_shard[runner_id_c]
+
+    assert shard_a.end_layer - shard_a.start_layer == expected_layers[0]
+    assert shard_b.end_layer - shard_b.start_layer == expected_layers[1]
+    assert shard_c.end_layer - shard_c.start_layer == expected_layers[2]
+
+    shards = [shard_a, shard_b, shard_c]
+    shards_sorted = sorted(shards, key=lambda s: s.start_layer)
+    assert shards_sorted[0].start_layer == 0
+    assert shards_sorted[-1].end_layer == total_layers
+
+
+def test_get_instance_placements_one_node_exact_fit() -> None:
+    topology = Topology()
+    node_id = NodeId()
+    topology.add_node(node_id)
+    node_memory = {node_id: create_node_memory(1000 * 1024)}
+    node_network = {node_id: create_node_network()}
+    cic = place_instance_command(
+        ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_kb(1000),
+            n_layers=10,
+            hidden_size=1000,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
+        ),
+    )
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
+
+    assert len(placements) == 1
+    instance_id = list(placements.keys())[0]
+    instance = placements[instance_id]
+    assert instance.shard_assignments.model_id == "test-model"
+    assert len(instance.shard_assignments.node_to_runner) == 1
+    assert len(instance.shard_assignments.runner_to_shard) == 1
+    assert len(instance.shard_assignments.runner_to_shard) == 1
+
+
+def test_get_instance_placements_one_node_fits_with_extra_memory() -> None:
+    topology = Topology()
+    node_id = NodeId()
+    topology.add_node(node_id)
+    node_memory = {node_id: create_node_memory(1001 * 1024)}
+    node_network = {node_id: create_node_network()}
+    cic = place_instance_command(
+        ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_kb(1000),
+            n_layers=10,
+            hidden_size=1000,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
+        ),
+    )
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
+
+    assert len(placements) == 1
+    instance_id = list(placements.keys())[0]
+    instance = placements[instance_id]
+    assert instance.shard_assignments.model_id == "test-model"
+    assert len(instance.shard_assignments.node_to_runner) == 1
+    assert len(instance.shard_assignments.runner_to_shard) == 1
+    assert len(instance.shard_assignments.runner_to_shard) == 1
+
+
+def test_get_instance_placements_one_node_not_fit() -> None:
+    topology = Topology()
+    node_id = NodeId()
+    topology.add_node(node_id)
+    node_memory = {node_id: create_node_memory(1000 * 1024)}
+    node_network = {node_id: create_node_network()}
+    cic = place_instance_command(
+        model_card=ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_kb(1001),
+            n_layers=10,
+            hidden_size=1000,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
+        ),
+    )
+
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+        )
+    assert str(error.value) == (
+        "Not enough memory: test-model needs 0.0 GB, but connected nodes can use at most "
+        "0.0 GB between them"
+    )
+
+
+def _connected(*groups: list[NodeId]) -> Topology:
+    """Nodes connected both ways to every other node in their group."""
+    topology = Topology()
+    port = 0
+    for group in groups:
+        for node_id in group:
+            topology.add_node(node_id)
+        for source in group:
+            for sink in group:
+                if source != sink:
+                    port += 1
+                    topology.add_connection(
+                        Connection(
+                            source=source,
+                            sink=sink,
+                            edge=create_socket_connection(port),
+                        )
+                    )
+    return topology
+
+
+def _small_model() -> ModelCard:
+    return ModelCard(
+        model_id=ModelId("test-model"),
+        storage_size=Memory.from_kb(1000),
+        n_layers=10,
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+
+
+def test_placement_says_when_too_few_nodes_are_connected() -> None:
+    a, b, c = NodeId(), NodeId(), NodeId()
+    topology = _connected([a, b], [c])
+    node_memory = {n: create_node_memory(10**9) for n in (a, b, c)}
+    node_network = {n: create_node_network() for n in (a, b, c)}
+    command = place_instance_command(_small_model()).model_copy(update={"min_nodes": 3})
+
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+        )
+
+    assert str(error.value) == (
+        "Needs 3 connected nodes, but at most 2 are connected to each other"
+    )
+
+
+def test_placement_says_when_there_are_no_nodes() -> None:
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            place_instance_command(_small_model()), Topology(), {}, {}, {}, {}
+        )
+
+    assert str(error.value) == "No nodes are available"
+
+
+def test_placement_says_when_the_chosen_nodes_are_not_connected() -> None:
+    a, b, c = NodeId(), NodeId(), NodeId()
+    topology = _connected([a, b], [c])
+    node_memory = {n: create_node_memory(10**9) for n in (a, b, c)}
+    node_network = {n: create_node_network() for n in (a, b, c)}
+
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            place_instance_command(_small_model()),
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+            required_nodes={a, c},
+        )
+
+    assert str(error.value) == ("The chosen nodes aren't all connected to each other")
+
+
+def test_placement_says_how_much_memory_is_free() -> None:
+    a, b = NodeId(), NodeId()
+    topology = _connected([a, b])
+    node_memory = {
+        a: create_node_memory(300 * 1024**2),
+        b: create_node_memory(500 * 1024**2),
+    }
+    node_network = {n: create_node_network() for n in (a, b)}
+    model = _small_model().model_copy(
+        update={"storage_size": Memory.from_bytes(2 * 1024**3)}
+    )
+
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            place_instance_command(model),
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+        )
+
+    assert str(error.value) == (
+        "Not enough memory: test-model needs 2.0 GB, but connected nodes can use at most "
+        "0.8 GB between them"
+    )
+
+
+def test_placement_says_when_nodes_have_not_reported_their_memory() -> None:
+    a, b = NodeId(), NodeId()
+    topology = _connected([a, b])
+
+    with pytest.raises(ValueError) as error:
+        place_instance(
+            place_instance_command(_small_model()),
+            topology,
+            {},
+            {},
+            {},
+            {a: [Backend.MlxMetal], b: [Backend.MlxMetal]},
+        )
+
+    assert str(error.value) == "Waiting for the nodes to report their memory"
+
+
+def test_removal_events_remove_the_instance_with_its_reason():
+    instance_id = InstanceId()
+
+    events = removal_events(instance_id, "StartFailed", AT)
+
+    assert events == [
+        InstanceDeleted(
+            instance_id=instance_id,
+            reason="StartFailed",
+            at=AT.isoformat(),
+            event_id=events[0].event_id,
+        )
+    ]
+
+
+def test_placement_selects_leaf_nodes(
+    model_card: ModelCard,
+):
+    # arrange
+    topology = Topology()
+
+    model_card = model_card.model_copy(update={"storage_size": Memory.from_bytes(1000)})
+
+    node_id_a = NodeId()
+    node_id_b = NodeId()
+    node_id_c = NodeId()
+    node_id_d = NodeId()
+
+    node_memory = {
+        node_id_a: create_node_memory(500),
+        node_id_b: create_node_memory(600),
+        node_id_c: create_node_memory(600),
+        node_id_d: create_node_memory(500),
+    }
+    node_network = {
+        node_id_a: create_node_network(),
+        node_id_b: create_node_network(),
+        node_id_c: create_node_network(),
+        node_id_d: create_node_network(),
+    }
+
+    topology.add_node(node_id_a)
+    topology.add_node(node_id_b)
+    topology.add_node(node_id_c)
+    topology.add_node(node_id_d)
+
+    # Daisy chain topology (directed)
+    topology.add_connection(
+        Connection(source=node_id_a, sink=node_id_b, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_b, sink=node_id_a, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_b, sink=node_id_c, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_c, sink=node_id_b, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_c, sink=node_id_d, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_d, sink=node_id_c, edge=create_socket_connection(1))
+    )
+
+    cic = place_instance_command(model_card=model_card)
+
+    # act
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
+
+    # assert
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+
+    assigned_nodes = set(instance.shard_assignments.node_to_runner.keys())
+    assert assigned_nodes == set((node_id_a, node_id_b)) or assigned_nodes == set(
+        (
+            node_id_c,
+            node_id_d,
+        )
+    )
+
+
+def test_tensor_rdma_backend_connectivity_matrix(
+    model_card: ModelCard,
+):
+    # arrange
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "n_layers": 12,
+            "storage_size": Memory.from_bytes(1500),
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    node_c = NodeId()
+
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+        node_c: create_node_memory(500),
+    }
+
+    ethernet_interface = NetworkInterfaceInfo(
+        name="en0",
+        ip_address="10.0.0.1",
+    )
+    ethernet_conn = SocketConnection(
+        sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_b: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_c: NodeNetworkInfo(interfaces=[ethernet_interface]),
+    }
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_node(node_c)
+
+    # RDMA connections (directed)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_c, edge=create_rdma_connection(4))
+    )
+    topology.add_connection(
+        Connection(source=node_c, sink=node_b, edge=create_rdma_connection(4))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_c, edge=create_rdma_connection(5))
+    )
+    topology.add_connection(
+        Connection(source=node_c, sink=node_a, edge=create_rdma_connection(5))
+    )
+
+    # Ethernet connections (directed)
+    topology.add_connection(Connection(source=node_a, sink=node_b, edge=ethernet_conn))
+    topology.add_connection(Connection(source=node_b, sink=node_c, edge=ethernet_conn))
+    topology.add_connection(Connection(source=node_c, sink=node_a, edge=ethernet_conn))
+    topology.add_connection(Connection(source=node_a, sink=node_c, edge=ethernet_conn))
+    topology.add_connection(Connection(source=node_b, sink=node_a, edge=ethernet_conn))
+    topology.add_connection(Connection(source=node_c, sink=node_b, edge=ethernet_conn))
+
+    cic = PlacementRequest(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        model_card=model_card,
+        min_nodes=1,
+    )
+
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+        node_c: NodeRdmaCtlStatus(enabled=True),
+    }
+
+    # act
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        node_rdma_ctl=node_rdma_ctl,
+    )
+
+    # assert
+    assert len(placements) == 1
+    instance_id = list(placements.keys())[0]
+    instance = placements[instance_id]
+
+    assert isinstance(instance, MlxJacclInstance)
+
+    assert instance.jaccl_devices is not None
+    assert instance.jaccl_coordinators is not None
+
+    matrix = instance.jaccl_devices
+    assert len(matrix) == 3
+    for i in range(3):
+        assert matrix[i][i] is None
+
+    assigned_nodes = list(instance.shard_assignments.node_to_runner.keys())
+    node_to_idx = {node_id: idx for idx, node_id in enumerate(assigned_nodes)}
+
+    idx_a = node_to_idx[node_a]
+    idx_b = node_to_idx[node_b]
+    idx_c = node_to_idx[node_c]
+
+    assert matrix[idx_a][idx_b] == "rdma_en3"
+    assert matrix[idx_b][idx_c] == "rdma_en4"
+    assert matrix[idx_c][idx_a] == "rdma_en5"
+
+    # Verify coordinators are set for all nodes
+    assert len(instance.jaccl_coordinators) == 3
+    for node_id in assigned_nodes:
+        assert node_id in instance.jaccl_coordinators
+        coordinator = instance.jaccl_coordinators[node_id]
+        assert ":" in coordinator
+        # Rank 0 node should use 0.0.0.0, others should use connection-specific IPs
+        if node_id == assigned_nodes[0]:
+            assert coordinator.startswith("0.0.0.0:")
+        else:
+            ip_part = coordinator.split(":")[0]
+            assert len(ip_part.split(".")) == 4
+
+
+def _build_three_node_rdma_topology() -> tuple[
+    Topology, NodeId, NodeId, NodeId, dict[NodeId, NodeNetworkInfo]
+]:
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    node_c = NodeId()
+
+    ethernet_interface = NetworkInterfaceInfo(name="en0", ip_address="10.0.0.1")
+    ethernet_conn = SocketConnection(
+        sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
+    )
+    node_network = {
+        node_a: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_b: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_c: NodeNetworkInfo(interfaces=[ethernet_interface]),
+    }
+
+    for n in (node_a, node_b, node_c):
+        topology.add_node(n)
+
+    rdma_pairs = [
+        (node_a, node_b, 3),
+        (node_b, node_a, 3),
+        (node_b, node_c, 4),
+        (node_c, node_b, 4),
+        (node_a, node_c, 5),
+        (node_c, node_a, 5),
+    ]
+    for src, sink, iface in rdma_pairs:
+        topology.add_connection(
+            Connection(source=src, sink=sink, edge=create_rdma_connection(iface))
+        )
+
+    socket_pairs = [
+        (node_a, node_b),
+        (node_b, node_c),
+        (node_c, node_a),
+        (node_a, node_c),
+        (node_b, node_a),
+        (node_c, node_b),
+    ]
+    for src, sink in socket_pairs:
+        topology.add_connection(Connection(source=src, sink=sink, edge=ethernet_conn))
+
+    return topology, node_a, node_b, node_c, node_network
+
+
+def test_place_mlx_jaccl_rejects_when_a_node_has_rdma_ctl_disabled(
+    model_card: ModelCard,
+):
+    # arrange
+    model_card = model_card.model_copy(
+        update={"n_layers": 12, "storage_size": Memory.from_bytes(1500)}
+    )
+    topology, node_a, node_b, node_c, node_network = _build_three_node_rdma_topology()
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+        node_c: create_node_memory(500),
+    }
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+        node_c: NodeRdmaCtlStatus(enabled=False),
+    }
+    cic = PlacementRequest(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        model_card=model_card,
+        min_nodes=3,
+    )
+
+    # act / assert
+    with pytest.raises(
+        ValueError, match="Requested RDMA \\(MlxJaccl\\) but no RDMA-connected cycles"
+    ):
+        place_instance(
+            cic,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+            node_rdma_ctl=node_rdma_ctl,
+        )
+
+
+def test_place_mlx_jaccl_rejects_when_node_rdma_ctl_missing(model_card: ModelCard):
+    """A node with no observed rdma_ctl status must not participate in RDMA placement."""
+    # arrange
+    model_card = model_card.model_copy(
+        update={"n_layers": 12, "storage_size": Memory.from_bytes(1500)}
+    )
+    topology, node_a, node_b, node_c, node_network = _build_three_node_rdma_topology()
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+        node_c: create_node_memory(500),
+    }
+    # node_c has no rdma_ctl entry at all
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
+    cic = PlacementRequest(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        model_card=model_card,
+        min_nodes=3,
+    )
+
+    # act / assert
+    with pytest.raises(ValueError):
+        place_instance(
+            cic,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+            node_rdma_ctl=node_rdma_ctl,
+        )
+
+
+def _make_shard_metadata(model_card: ModelCard) -> PipelineShardMetadata:
+    return PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=model_card.n_layers,
+        n_layers=model_card.n_layers,
+    )
+
+
+def test_placement_prefers_cycle_with_downloaded_model(
+    model_card: ModelCard,
+) -> None:
+    """When two cycles are otherwise equal, prefer the one with the model already downloaded."""
+    topology = Topology()
+
+    model_card = model_card.model_copy(update={"storage_size": Memory.from_bytes(500)})
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    node_memory = {
+        node_a: create_node_memory(1000),
+        node_b: create_node_memory(1000),
+    }
+    node_network = {
+        node_a: create_node_network(),
+        node_b: create_node_network(),
+    }
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    # No connections between them — two single-node cycles
+
+    shard_meta = _make_shard_metadata(model_card)
+
+    # node_b has the model fully downloaded, node_a does not
+    download_status = {
+        node_b: [
+            DownloadCompleted(
+                node_id=node_b,
+                shard_metadata=shard_meta,
+                total=model_card.storage_size,
+            ),
+        ],
+    }
+
+    cic = place_instance_command(model_card)
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
+    )
+
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+    assigned_nodes = set(instance.shard_assignments.node_to_runner.keys())
+    assert assigned_nodes == {node_b}
+
+
+def test_placement_prefers_cycle_with_higher_download_progress(
+    model_card: ModelCard,
+) -> None:
+    """When two cycles are otherwise equal, prefer the one with more download progress."""
+    topology = Topology()
+
+    model_card = model_card.model_copy(update={"storage_size": Memory.from_bytes(1000)})
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    node_memory = {
+        node_a: create_node_memory(1000),
+        node_b: create_node_memory(1000),
+    }
+    node_network = {
+        node_a: create_node_network(),
+        node_b: create_node_network(),
+    }
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+
+    shard_meta = _make_shard_metadata(model_card)
+
+    # node_a: 30% downloaded, node_b: 80% downloaded
+    download_status = {
+        node_a: [
+            DownloadOngoing(
+                node_id=node_a,
+                shard_metadata=shard_meta,
+                download_progress=DownloadProgressData(
+                    total=Memory.from_bytes(1000),
+                    downloaded=Memory.from_bytes(300),
+                    downloaded_this_session=Memory.from_bytes(300),
+                    completed_files=0,
+                    total_files=1,
+                    speed=0.0,
+                    eta_ms=0,
+                    files={},
+                ),
+            ),
+        ],
+        node_b: [
+            DownloadOngoing(
+                node_id=node_b,
+                shard_metadata=shard_meta,
+                download_progress=DownloadProgressData(
+                    total=Memory.from_bytes(1000),
+                    downloaded=Memory.from_bytes(800),
+                    downloaded_this_session=Memory.from_bytes(800),
+                    completed_files=0,
+                    total_files=1,
+                    speed=0.0,
+                    eta_ms=0,
+                    files={},
+                ),
+            ),
+        ],
+    }
+
+    cic = place_instance_command(model_card)
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
+    )
+
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+    assigned_nodes = set(instance.shard_assignments.node_to_runner.keys())
+    assert assigned_nodes == {node_b}
+
+
+def test_placement_does_not_prefer_cycle_with_failed_download(
+    model_card: ModelCard,
+) -> None:
+    """A failed download should count as 0% — not preferred over a node with no download history."""
+    topology = Topology()
+
+    model_card = model_card.model_copy(update={"storage_size": Memory.from_bytes(500)})
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    # node_a has slightly more RAM so it would win on the RAM tiebreaker
+    node_memory = {
+        node_a: create_node_memory(1001),
+        node_b: create_node_memory(1000),
+    }
+    node_network = {
+        node_a: create_node_network(),
+        node_b: create_node_network(),
+    }
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+
+    shard_meta = _make_shard_metadata(model_card)
+
+    # node_b has a failed download — should not be preferred
+    download_status = {
+        node_b: [
+            DownloadFailed(
+                node_id=node_b,
+                shard_metadata=shard_meta,
+                error_message="connection reset",
+            ),
+        ],
+    }
+
+    cic = place_instance_command(model_card)
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
+    )
+
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+    assigned_nodes = set(instance.shard_assignments.node_to_runner.keys())
+    # node_a should win on RAM tiebreaker since failed download scores 0.0
+    assert assigned_nodes == {node_a}
+
+
+def test_placement_rejects_when_model_backends_disjoint_from_engine(
+    model_card: ModelCard,
+):
+    topology = Topology()
+    node_id = NodeId()
+    topology.add_node(node_id)
+    node_memory = {node_id: create_node_memory(1000 * 1024)}
+    node_network = {node_id: create_node_network()}
+
+    cic = place_instance_command(
+        model_card.model_copy(update={"backends": [Backend.Vllm]})
+    )
+
+    with pytest.raises(ValueError, match="cannot satisfy engine MlxRing"):
+        place_instance(
+            cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+        )
+
+
+def test_placement_rejects_when_only_some_nodes_support_backend(
+    model_card: ModelCard,
+):
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    node_c = NodeId()
+    for n in (node_a, node_b, node_c):
+        topology.add_node(n)
+
+    eth = create_socket_connection(1)
+    for src, dst in [
+        (node_a, node_b),
+        (node_b, node_c),
+        (node_c, node_a),
+        (node_a, node_c),
+        (node_c, node_b),
+        (node_b, node_a),
+    ]:
+        topology.add_connection(Connection(source=src, sink=dst, edge=eth))
+
+    node_memory = {n: create_node_memory(500 * 1024) for n in (node_a, node_b, node_c)}
+    node_network = {n: create_node_network() for n in (node_a, node_b, node_c)}
+    node_backends = {
+        node_a: [Backend.MlxMetal],
+        node_b: [Backend.MlxMetal],
+        node_c: [Backend.MlxCuda],  # the lone CUDA-only node breaks the cycle
+    }
+
+    cic = place_instance_command(
+        model_card.model_copy(
+            update={
+                "backends": [Backend.MlxMetal],
+                "n_layers": 12,
+                "storage_size": Memory.from_kb(1500),
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="No cycle where every node supports"):
+        place_instance(cic, topology, {}, node_memory, node_network, node_backends)
+
+
+def test_mlx_jaccl_rejects_cuda_only_cycle(model_card: ModelCard):
+    topology, node_a, node_b, node_c, node_network = _build_three_node_rdma_topology()
+    node_memory = {n: create_node_memory(500) for n in (node_a, node_b, node_c)}
+    node_rdma_ctl = {
+        n: NodeRdmaCtlStatus(enabled=True) for n in (node_a, node_b, node_c)
+    }
+    node_backends = {n: [Backend.MlxCuda] for n in (node_a, node_b, node_c)}
+
+    cic = PlacementRequest(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        model_card=model_card.model_copy(
+            update={
+                "backends": [Backend.MlxMetal, Backend.MlxCuda],
+                "n_layers": 12,
+                "storage_size": Memory.from_bytes(1500),
+            }
+        ),
+        min_nodes=3,
+    )
+
+    with pytest.raises(ValueError, match="No cycle where every node supports"):
+        place_instance(
+            cic,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_rdma_ctl=node_rdma_ctl,
+        )
+
+
+# Memory taken by instances that are still loading
+
+
+GB = 1024**3
+
+
+def _two_connected_nodes(
+    memory_bytes: int,
+) -> tuple[
+    Topology,
+    dict[NodeId, MemoryUsage],
+    dict[NodeId, NodeNetworkInfo],
+    list[NodeId],
+]:
+    a, b = NodeId(), NodeId()
+    topology = Topology()
+    topology.add_node(a)
+    topology.add_node(b)
+    topology.add_connection(
+        Connection(source=a, sink=b, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=b, sink=a, edge=create_socket_connection(2))
+    )
+    node_memory = {n: create_node_memory(memory_bytes) for n in (a, b)}
+    node_network = {n: create_node_network() for n in (a, b)}
+    return topology, node_memory, node_network, [a, b]
+
+
+def _model_of(name: str, size_bytes: int) -> ModelCard:
+    return ModelCard(
+        model_id=ModelId(name),
+        storage_size=Memory.from_bytes(size_bytes),
+        n_layers=10,
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+
+
+def _place(
+    model: ModelCard,
+    topology: Topology,
+    instances: Mapping[InstanceId, Instance],
+    node_memory: Mapping[NodeId, MemoryUsage],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+    runners: Mapping[RunnerId, RunnerStatus],
+    sharding: Sharding = Sharding.Pipeline,
+    min_nodes: int = 1,
+) -> tuple[dict[InstanceId, Instance], Instance]:
+    placement = place_instance(
+        place_instance_command(model).model_copy(
+            update={"sharding": sharding, "min_nodes": min_nodes}
+        ),
+        topology,
+        instances,
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        runners=runners,
+    )
+    (new,) = [i for i in placement.values() if i.instance_id not in instances]
+    return placement, new
+
+
+def _nodes_of(instance: Instance) -> set[NodeId]:
+    return set(instance.shard_assignments.node_to_runner)
+
+
+def test_a_second_model_goes_to_the_other_node_while_the_first_loads() -> None:
+    topology, node_memory, node_network, _ = _two_connected_nodes(10 * GB)
+
+    instances, first = _place(
+        _model_of("model-a", 6 * GB), topology, {}, node_memory, node_network, {}
+    )
+    # The first one's runner hasn't loaded, so its node still reports 10 GB free
+    _, second = _place(
+        _model_of("model-b", 6 * GB), topology, instances, node_memory, node_network, {}
+    )
+
+    assert _nodes_of(first).isdisjoint(_nodes_of(second))
+
+
+def test_a_model_that_only_fits_in_memory_still_loading_is_refused() -> None:
+    topology = Topology()
+    node = NodeId()
+    topology.add_node(node)
+    node_memory = {node: create_node_memory(10 * GB)}
+    node_network = {node: create_node_network()}
+    instances, _ = _place(
+        _model_of("model-a", 6 * GB), topology, {}, node_memory, node_network, {}
+    )
+
+    with pytest.raises(ValueError, match="Not enough memory|sufficient memory"):
+        _place(
+            _model_of("model-b", 6 * GB),
+            topology,
+            instances,
+            node_memory,
+            node_network,
+            {},
+        )
+
+
+def test_a_loaded_runner_is_not_counted_twice() -> None:
+    topology = Topology()
+    node = NodeId()
+    topology.add_node(node)
+    node_network = {node: create_node_network()}
+    instances, first = _place(
+        _model_of("model-a", 6 * GB),
+        topology,
+        {},
+        {node: create_node_memory(10 * GB)},
+        node_network,
+        {},
+    )
+    (runner_id,) = first.shard_assignments.node_to_runner.values()
+    # Loaded: the node's report already shows the 6 GB as used
+    loaded_memory = {node: create_node_memory(4 * GB)}
+
+    _, second = _place(
+        _model_of("model-b", 3 * GB),
+        topology,
+        instances,
+        loaded_memory,
+        node_network,
+        {runner_id: RunnerReady()},
+    )
+
+    assert _nodes_of(second) == {node}
+
+
+def test_each_runner_holds_its_share_of_the_model_until_loaded() -> None:
+    topology, node_memory, node_network, nodes = _two_connected_nodes(100 * GB)
+    _, tensor = _place(
+        _model_of("model-a", 8 * GB),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        {},
+        sharding=Sharding.Tensor,
+        min_nodes=2,
+    )
+    _, pipeline = _place(
+        _model_of("model-b", 10 * GB),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        {},
+        min_nodes=2,
+    )
+
+    def free_gb(
+        instance: Instance, runners: Mapping[RunnerId, RunnerStatus]
+    ) -> list[float]:
+        free = memory_once_loaded(
+            node_memory, {instance.instance_id: instance}, runners
+        )
+        return [round(free[n].ram_available.in_bytes / GB, 2) for n in nodes]
+
+    # Tensor: each node holds half of the 8 GB
+    assert free_gb(tensor, {}) == [96.0, 96.0]
+    # Pipeline: each node holds its layers' share of the 10 GB
+    layers = {
+        node: (shard.end_layer - shard.start_layer)
+        for node, runner in pipeline.shard_assignments.node_to_runner.items()
+        for shard in [pipeline.shard_assignments.runner_to_shard[runner]]
+    }
+    assert free_gb(pipeline, {}) == [100 - layers[n] for n in nodes]
+
+
+def test_which_runners_hold_memory_they_have_not_taken_yet() -> None:
+    topology = Topology()
+    node = NodeId()
+    topology.add_node(node)
+    node_memory = {node: create_node_memory(10 * GB)}
+    _, instance = _place(
+        _model_of("model-a", 6 * GB),
+        topology,
+        {},
+        node_memory,
+        {node: create_node_network()},
+        {},
+    )
+    (runner_id,) = instance.shard_assignments.node_to_runner.values()
+
+    def free_gb(status: RunnerStatus | None) -> float:
+        runners = {} if status is None else {runner_id: status}
+        free = memory_once_loaded(
+            node_memory, {instance.instance_id: instance}, runners
+        )
+        return free[node].ram_available.in_bytes / GB
+
+    # Not started, starting, loading, or failed and about to load again: still to take
+    for status in (
+        None,
+        RunnerIdle(),
+        RunnerConnecting(),
+        RunnerLoading(),
+        RunnerFailed(error_message="oom", diagnostics=[]),
+    ):
+        assert free_gb(status) == 4.0, status
+    # Loaded (in the node's report already), or going away
+    for status in (
+        RunnerLoaded(),
+        RunnerWarmingUp(),
+        RunnerReady(),
+        RunnerRunning(),
+        RunnerShuttingDown(),
+    ):
+        assert free_gb(status) == 10.0, status

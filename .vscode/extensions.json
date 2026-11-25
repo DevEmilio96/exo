@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "detachhead.basedpyright",
+        "ms-python.python",
+        "jnoortheen.nix-ide",
+        "charliermarsh.ruff",
+    ],
+    "unwantedRecommendations": [
+        "ms-python.vscode-pylance",
+        "ms-python.pyright",
+        "ms-python.mypy-type-checker"
+    ]
+}
